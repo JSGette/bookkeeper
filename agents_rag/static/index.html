@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agents-rag</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0f1117;
+  --surface: #181a20;
+  --surface2: #23262f;
+  --border: #2e3140;
+  --text: #e1e3e8;
+  --text2: #9196a1;
+  --accent: #6c8cff;
+  --accent-dim: #3d4f80;
+  --tag-bg: #262a36;
+  --tag-active: #3b4a6b;
+  --danger: #ff6b6b;
+  --green: #51cf66;
+  --radius: 6px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+  --mono: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+}
+
+body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
+
+/* layout */
+.app { display: flex; height: 100vh; overflow: hidden; }
+.sidebar { width: 260px; min-width: 200px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* stats bar */
+.stats-bar { display: flex; gap: 16px; padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
+.stat { display: flex; align-items: baseline; gap: 4px; }
+.stat-value { font-size: 18px; font-weight: 600; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--text2); }
+
+/* search */
+.search-area { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: center; }
+.search-area input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); padding: 8px 12px; font-size: 14px; outline: none; }
+.search-area input:focus { border-color: var(--accent); }
+.showing { font-size: 12px; color: var(--text2); white-space: nowrap; }
+
+/* source pills */
+.source-filters { display: flex; gap: 6px; padding: 12px 20px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.pill { padding: 4px 10px; border-radius: 14px; font-size: 12px; cursor: pointer; border: 1px solid var(--border); background: var(--surface2); color: var(--text2); transition: all .15s; user-select: none; }
+.pill:hover { border-color: var(--accent-dim); }
+.pill.active { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
+.pill .count { margin-left: 4px; opacity: .6; }
+
+/* sidebar tags */
+.sidebar-header { padding: 14px 16px 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text2); }
+.tag-search { margin: 0 12px 8px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); padding: 6px 10px; font-size: 13px; outline: none; width: calc(100% - 24px); }
+.tag-search:focus { border-color: var(--accent); }
+.tag-list { flex: 1; overflow-y: auto; padding: 0 12px 12px; }
+.tag-item { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 13px; user-select: none; margin-bottom: 1px; }
+.tag-item:hover { background: var(--surface2); }
+.tag-item.active { background: var(--tag-active); color: var(--text); }
+.tag-item .tag-count { font-size: 11px; color: var(--text2); font-family: var(--mono); }
+
+/* results */
+.results-area { flex: 1; overflow-y: auto; padding: 12px 20px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 8px; }
+.card.deprecated { opacity: .5; }
+.card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
+.card-title { font-size: 14px; font-weight: 600; color: var(--accent); word-break: break-all; font-family: var(--mono); }
+.card-title a { color: inherit; text-decoration: none; }
+.card-title a:hover { text-decoration: underline; }
+.card-source { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--text2); white-space: nowrap; flex-shrink: 0; }
+.card-section { font-size: 13px; color: var(--text2); margin-bottom: 4px; }
+.card-desc { font-size: 13px; color: var(--text2); margin-bottom: 8px; }
+.card-preview { font-size: 12px; color: var(--text2); font-family: var(--mono); white-space: pre-wrap; background: var(--bg); border-radius: 4px; padding: 8px; margin-bottom: 8px; max-height: 80px; overflow: hidden; }
+.card-footer { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.card-tag { font-size: 11px; padding: 2px 7px; border-radius: 10px; background: var(--tag-bg); color: var(--text2); cursor: pointer; }
+.card-tag:hover { background: var(--tag-active); }
+.card-meta { font-size: 11px; color: var(--text2); margin-left: auto; }
+.card-deprecated { font-size: 11px; color: var(--danger); font-weight: 600; }
+.line-range { font-family: var(--mono); font-size: 11px; color: var(--text2); }
+
+/* load more */
+.load-more { text-align: center; padding: 16px; }
+.load-more button { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 24px; border-radius: var(--radius); cursor: pointer; font-size: 13px; }
+.load-more button:hover { border-color: var(--accent); }
+
+/* loading */
+.loading { text-align: center; padding: 60px 20px; color: var(--text2); }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text2); }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header">Tags</div>
+    <input class="tag-search" type="text" placeholder="Filter tags…" id="tagSearch">
+    <div class="tag-list" id="tagList"></div>
+  </aside>
+  <div class="main">
+    <div class="stats-bar" id="statsBar"><span class="loading">Loading…</span></div>
+    <div class="search-area">
+      <input type="text" placeholder="Search by keyword…" id="searchInput" autofocus>
+      <span class="showing" id="showing"></span>
+    </div>
+    <div class="source-filters" id="sourceFilters"></div>
+    <div class="results-area" id="results"><div class="loading">Loading index…</div></div>
+  </div>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  const PAGE_SIZE = 100;
+  let allChunks = [];
+  let filtered = [];
+  let stats = {};
+  let deprecatedPaths = {};
+  let activeSources = new Set();
+  let activeTags = new Set();
+  let searchQuery = "";
+  let tagFilter = "";
+  let visibleCount = PAGE_SIZE;
+
+  const $ = id => document.getElementById(id);
+
+  async function fetchJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json();
+  }
+
+  async function init() {
+    try {
+      const [chunks, statsData] = await Promise.all([
+        fetchJSON("/api/chunks"),
+        fetchJSON("/api/stats"),
+      ]);
+      if (chunks.error) { $("results").innerHTML = `<div class="loading">${chunks.error}</div>`; return; }
+      allChunks = chunks;
+      stats = statsData;
+      renderStats();
+      renderSourceFilters();
+      renderTagSidebar();
+      applyFilters();
+    } catch (e) {
+      $("results").innerHTML = `<div class="loading">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  function renderStats() {
+    const bar = $("statsBar");
+    const parts = [`<div class="stat"><span class="stat-value">${stats.total.toLocaleString()}</span><span class="stat-label">chunks</span></div>`];
+    for (const [src, count] of Object.entries(stats.sources || {})) {
+      parts.push(`<div class="stat"><span class="stat-value">${count.toLocaleString()}</span><span class="stat-label">${esc(src)}</span></div>`);
+    }
+    if (stats.deprecated > 0) {
+      parts.push(`<div class="stat"><span class="stat-value" style="color:var(--danger)">${stats.deprecated}</span><span class="stat-label">deprecated</span></div>`);
+    }
+    const tagCount = Object.keys(stats.tags || {}).length;
+    parts.push(`<div class="stat"><span class="stat-value">${tagCount}</span><span class="stat-label">unique tags</span></div>`);
+    bar.innerHTML = parts.join("");
+  }
+
+  function renderSourceFilters() {
+    const el = $("sourceFilters");
+    // "All" pill
+    let html = `<span class="pill active" data-source="__all__">All<span class="count">${stats.total}</span></span>`;
+    for (const [src, count] of Object.entries(stats.sources || {})) {
+      html += `<span class="pill" data-source="${esc(src)}">${esc(src)}<span class="count">${count}</span></span>`;
+    }
+    el.innerHTML = html;
+    el.addEventListener("click", e => {
+      const pill = e.target.closest(".pill");
+      if (!pill) return;
+      const src = pill.dataset.source;
+      if (src === "__all__") {
+        activeSources.clear();
+      } else {
+        if (activeSources.has(src)) activeSources.delete(src); else activeSources.add(src);
+      }
+      // update pill classes
+      el.querySelectorAll(".pill").forEach(p => {
+        if (p.dataset.source === "__all__") p.classList.toggle("active", activeSources.size === 0);
+        else p.classList.toggle("active", activeSources.has(p.dataset.source));
+      });
+      applyFilters();
+    });
+  }
+
+  function renderTagSidebar() {
+    renderTagList();
+    $("tagSearch").addEventListener("input", e => { tagFilter = e.target.value.toLowerCase(); renderTagList(); });
+  }
+
+  function renderTagList() {
+    const tags = Object.entries(stats.tags || {});
+    const el = $("tagList");
+    let html = "";
+    for (const [tag, count] of tags) {
+      if (tagFilter && !tag.toLowerCase().includes(tagFilter)) continue;
+      const active = activeTags.has(tag) ? " active" : "";
+      html += `<div class="tag-item${active}" data-tag="${esc(tag)}"><span>${esc(tag)}</span><span class="tag-count">${count}</span></div>`;
+    }
+    el.innerHTML = html || `<div style="padding:8px;color:var(--text2);font-size:12px">No tags</div>`;
+    el.querySelectorAll(".tag-item").forEach(item => {
+      item.addEventListener("click", () => {
+        const tag = item.dataset.tag;
+        if (activeTags.has(tag)) activeTags.delete(tag); else activeTags.add(tag);
+        item.classList.toggle("active");
+        applyFilters();
+      });
+    });
+  }
+
+  function applyFilters() {
+    const q = searchQuery.toLowerCase();
+    filtered = allChunks.filter(c => {
+      if (activeSources.size > 0 && !activeSources.has(c.source)) return false;
+      if (activeTags.size > 0) {
+        const cTags = c.tags || [];
+        for (const t of activeTags) { if (!cTags.includes(t)) return false; }
+      }
+      if (q) {
+        const haystack = [c.path, c.doc_title, c.section_heading, c.description, ...(c.tags || [])].join(" ").toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      return true;
+    });
+    visibleCount = PAGE_SIZE;
+    renderResults();
+  }
+
+  function renderResults() {
+    const el = $("results");
+    $("showing").textContent = `Showing ${Math.min(visibleCount, filtered.length).toLocaleString()} of ${filtered.length.toLocaleString()}`;
+    if (filtered.length === 0) { el.innerHTML = `<div class="loading">No results</div>`; return; }
+
+    let html = "";
+    const slice = filtered.slice(0, visibleCount);
+    for (const c of slice) {
+      const isDeprecated = (c.deprecated === true) ? " deprecated" : "";
+      const title = c.doc_title || c.path || "Untitled";
+      const lineRange = (c.start_line != null && c.end_line != null) ? `<span class="line-range">L${c.start_line}–${c.end_line}</span>` : "";
+
+      html += `<div class="card${isDeprecated}">`;
+      html += `<div class="card-header">`;
+      html += `<span class="card-title">${esc(title)}</span>`;
+      html += `<span class="card-source">${esc(c.source || "")}</span>`;
+      html += `</div>`;
+
+      if (c.section_heading) {
+        html += `<div class="card-section">${esc(c.section_heading)} ${lineRange}</div>`;
+      } else if (lineRange) {
+        html += `<div class="card-section">${lineRange}</div>`;
+      }
+
+      if (c.description) html += `<div class="card-desc">${esc(c.description)}</div>`;
+      if (c.preview) html += `<div class="card-preview">${esc(c.preview)}</div>`;
+      if (c.deprecated) html += `<div class="card-deprecated">DEPRECATED</div>`;
+
+      html += `<div class="card-footer">`;
+      for (const t of (c.tags || [])) {
+        html += `<span class="card-tag" data-tag="${esc(t)}">${esc(t)}</span>`;
+      }
+      if (c.indexed_at) html += `<span class="card-meta">${esc(c.indexed_at)}</span>`;
+      html += `</div></div>`;
+    }
+
+    if (filtered.length > visibleCount) {
+      html += `<div class="load-more"><button id="loadMore">Load more (${(filtered.length - visibleCount).toLocaleString()} remaining)</button></div>`;
+    }
+
+    el.innerHTML = html;
+
+    const btn = $("loadMore");
+    if (btn) btn.addEventListener("click", () => { visibleCount += PAGE_SIZE; renderResults(); });
+
+    // click tag in card to add as filter
+    el.querySelectorAll(".card-tag").forEach(t => {
+      t.addEventListener("click", () => {
+        const tag = t.dataset.tag;
+        if (!activeTags.has(tag)) {
+          activeTags.add(tag);
+          renderTagList();
+          applyFilters();
+        }
+      });
+    });
+  }
+
+  function esc(s) {
+    if (!s) return "";
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  // debounced search
+  let timer;
+  $("searchInput").addEventListener("input", e => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { searchQuery = e.target.value; applyFilters(); }, 200);
+  });
+
+  init();
+})();
+</script>
+</body>
+</html>

@@ -17,6 +17,9 @@ log = logging.getLogger(__name__)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
+# Keep model loaded briefly for sequential requests, then auto-unload.
+_keep_alive_raw = os.environ.get("OLLAMA_KEEP_ALIVE", "2m")
+OLLAMA_KEEP_ALIVE: int | str = int(_keep_alive_raw) if _keep_alive_raw.lstrip("-").isdigit() else _keep_alive_raw
 
 _STRIP_PREFIXES = {"docs", "public", "src"}
 
@@ -219,6 +222,7 @@ def generate_tags_gemma(text: str, rel_path: str, cache_dir: str, force: bool = 
                 "messages": messages,
                 "stream": False,
                 "format": _FORMAT_SCHEMA,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
                 "options": {
                     "temperature": 0.1,
                     "top_p": 0.95,

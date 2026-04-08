@@ -5,16 +5,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import yaml
 from fastmcp import FastMCP
 
 from .chunker import SourceConfig
 from .index_generator import update_index_file
-from .indexer import reindex_all
+from .indexer import embed_texts, load_index, reindex_all, save_index
 from .searcher import Searcher, load_deprecated, save_deprecated
 from .tagger import configure as configure_tagger
 from .transcript import TranscriptWatcher, distill_all_transcripts
@@ -76,6 +78,48 @@ watch_interval = sessions_config.get("watch_interval_minutes", 5)
 searcher = Searcher(cache_dir)
 index_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Index queue — serialises all embed-merge-save-reload work on a single thread
+# ---------------------------------------------------------------------------
+
+_index_q: queue.Queue[list[dict]] = queue.Queue()
+
+
+def _index_worker() -> None:
+    """Drain the queue in batches: embed new chunks, merge, save, reload."""
+    while True:
+        batch = _index_q.get()
+        if batch is None:
+            break
+        # Drain anything else that arrived while we were waiting
+        while not _index_q.empty():
+            try:
+                more = _index_q.get_nowait()
+                if more is not None:
+                    batch.extend(more)
+            except queue.Empty:
+                break
+        try:
+            with index_lock:
+                texts = [c["text"] for c in batch]
+                new_vecs = embed_texts(texts)
+                existing_vecs, existing_meta = load_index(cache_dir)
+                if existing_vecs is not None and existing_meta is not None:
+                    merged_vecs = np.vstack([existing_vecs, new_vecs])
+                    merged_meta = existing_meta + batch
+                else:
+                    merged_vecs = new_vecs
+                    merged_meta = batch
+                save_index(cache_dir, merged_vecs, merged_meta)
+                searcher.reload()
+            log.info("Index queue: flushed %d chunks", len(batch))
+        except Exception:
+            log.exception("Index queue: flush failed")
+
+
+_index_thread = threading.Thread(target=_index_worker, daemon=True, name="index-queue")
+_index_thread.start()
+
 mcp = FastMCP(name="agents-rag")
 
 # Start background watcher if configured
@@ -116,6 +160,10 @@ call `save_session` with a structured summary: title, what was done, key decisio
 files touched, and next steps. This lets the next chat resume without re-discovering context.
 9. Previous chat sessions are automatically indexed in the background. When starting new \
 work, `query_knowledge_base` will surface prior session notes alongside documentation.
+10. Some results include `text_preview` instead of full `text` when the chunk is large. \
+If the preview looks relevant, use the `path`, `start_line`, and `end_line` fields to \
+read the original file directly (e.g., via the Read tool). For session chunks where the \
+path is a generated summary, the preview is usually sufficient context.
 """
 
 
@@ -198,25 +246,8 @@ def reindex(source: str | None = None) -> str:
 
 
 def _flush_transcript_chunks(chunks: list[dict]) -> None:
-    """Embed and merge transcript chunks into the index immediately."""
-    from .indexer import embed_texts, load_index, save_index
-    import numpy as np
-
-    with index_lock:
-        texts = [c["text"] for c in chunks]
-        new_vecs = embed_texts(texts)
-
-        existing_vecs, existing_meta = load_index(cache_dir)
-        if existing_vecs is not None and existing_meta is not None:
-            merged_vecs = np.vstack([existing_vecs, new_vecs])
-            merged_meta = existing_meta + chunks
-        else:
-            merged_vecs = new_vecs
-            merged_meta = chunks
-
-        save_index(cache_dir, merged_vecs, merged_meta)
-        searcher.reload()
-        log.info("Flushed %d turn chunks to index", len(chunks))
+    """Enqueue transcript chunks for async embedding and index merge."""
+    _index_q.put(chunks)
 
 
 @mcp.tool
@@ -337,39 +368,23 @@ def save_session(
 
     Path(filepath).write_text("\n".join(parts))
 
-    # Index immediately
-    with index_lock:
-        from .indexer import embed_texts, load_index, save_index
-        import numpy as np
+    # Enqueue for async indexing
+    _index_q.put([{
+        "source": "sessions",
+        "path": filename,
+        "doc_title": title,
+        "section_heading": "",
+        "start_line": 0,
+        "end_line": 0,
+        "tags": [],
+        "description": summary[:200],
+        "text": "\n".join(parts),
+        "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }])
 
-        chunk_meta = {
-            "source": "sessions",
-            "path": filename,
-            "doc_title": title,
-            "section_heading": "",
-            "start_line": 0,
-            "end_line": 0,
-            "tags": [],
-            "description": summary[:200],
-            "text": "\n".join(parts),
-            "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        new_vec = embed_texts([chunk_meta["text"]])
-        existing_vecs, existing_meta = load_index(cache_dir)
-        if existing_vecs is not None and existing_meta is not None:
-            merged_vecs = np.vstack([existing_vecs, new_vec])
-            merged_meta = existing_meta + [chunk_meta]
-        else:
-            merged_vecs = new_vec
-            merged_meta = [chunk_meta]
-        save_index(cache_dir, merged_vecs, merged_meta)
-        searcher.reload()
-
-    elapsed_ms = int((time.monotonic() - t0) * 1000)
     return json.dumps({
-        "status": "saved",
+        "status": "queued",
         "path": filepath,
-        "elapsed_ms": elapsed_ms,
     })
 
 

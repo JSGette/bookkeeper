@@ -1,0 +1,128 @@
+"""Lightweight HTTP server for the agents-rag knowledge base browser."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from collections import Counter
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+
+import yaml
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger(__name__)
+
+_DEFAULT_CONFIG_PATHS = [
+    os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
+]
+
+
+def _load_config() -> dict:
+    config_path = os.environ.get("AGENTS_RAG_CONFIG")
+    search = [config_path] if config_path else _DEFAULT_CONFIG_PATHS
+    for p in search:
+        if p and Path(p).exists():
+            return yaml.safe_load(Path(p).read_text()) or {}
+    return {}
+
+
+def _read_json(path: Path) -> list | dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+class Handler(SimpleHTTPRequestHandler):
+    cache_dir: str = ""
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/" or self.path == "/index.html":
+            self._serve_html()
+        elif self.path == "/api/chunks":
+            self._serve_chunks()
+        elif self.path == "/api/stats":
+            self._serve_stats()
+        else:
+            self.send_error(404)
+
+    def _json_response(self, data: object, status: int = 200) -> None:
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_html(self) -> None:
+        html_path = Path(__file__).parent / "static" / "index.html"
+        if not html_path.exists():
+            self.send_error(500, "index.html not found")
+            return
+        body = html_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_chunks(self) -> None:
+        meta = _read_json(Path(self.cache_dir) / "chunks.json")
+        if meta is None:
+            self._json_response({"error": "No index found. Run reindex first."}, 404)
+            return
+        # Strip text field to reduce payload — keep a truncated preview
+        for m in meta:
+            text = m.pop("text", "")
+            m["preview"] = text[:200] if text else ""
+        self._json_response(meta)
+
+    def _serve_stats(self) -> None:
+        meta = _read_json(Path(self.cache_dir) / "chunks.json")
+        deprecated = _read_json(Path(self.cache_dir) / "deprecated.json") or {}
+        if meta is None:
+            self._json_response({"total": 0, "sources": {}, "tags": {}, "deprecated": 0})
+            return
+        source_counts: Counter[str] = Counter()
+        tag_counts: Counter[str] = Counter()
+        for m in meta:
+            source_counts[m.get("source", "unknown")] += 1
+            for t in m.get("tags", []):
+                tag_counts[t] += 1
+        self._json_response({
+            "total": len(meta),
+            "sources": dict(source_counts.most_common()),
+            "tags": dict(tag_counts.most_common(200)),
+            "deprecated": len(deprecated),
+        })
+
+    def log_message(self, format, *args):  # noqa: A002
+        log.info(format, *args)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="agents-rag web UI")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("AGENTS_RAG_WEB_PORT", "8808")))
+    args = parser.parse_args()
+
+    config = _load_config()
+    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
+    Handler.cache_dir = cache_dir
+
+    server = HTTPServer(("127.0.0.1", args.port), Handler)
+    log.info("Serving on http://127.0.0.1:%d  (cache_dir=%s)", args.port, cache_dir)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Shutting down")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

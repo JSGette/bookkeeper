@@ -182,6 +182,25 @@ files:
 
 Priority: manual override > LLM > path-based.
 
+## Web UI
+
+A read-only browser for the knowledge base index. Client-side keyword and tag filtering over all indexed chunks.
+
+```bash
+agents-rag-web            # http://127.0.0.1:8808
+agents-rag-web --port 9000
+```
+
+Endpoints:
+
+| Route | Description |
+|-------|-------------|
+| `GET /` | Single-page HTML app |
+| `GET /api/chunks` | All chunk metadata (text replaced with a 200-char preview) |
+| `GET /api/stats` | Aggregate counts: total chunks, per-source, per-tag, deprecated |
+
+The UI loads all metadata client-side and filters by keyword (path, title, heading, description, tags) and/or selected tags. No semantic search — use the MCP `query_knowledge_base` tool for that.
+
 ## Dependencies
 
 | Package | Purpose |

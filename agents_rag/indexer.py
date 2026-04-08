@@ -85,16 +85,17 @@ def _git_is_ancestor(repo_path: str, ancestor: str) -> bool:
         return False
 
 
-def _git_changed_files(repo_path: str, old_hash: str, new_hash: str) -> list[str] | None:
-    """Return list of changed .md files between two commits, or None to signal full reindex."""
+def _git_changed_files(
+    repo_path: str, old_hash: str, new_hash: str, file_types: list[str],
+) -> list[str] | None:
+    """Return list of changed files between two commits, or None to signal full reindex."""
     if not _git_is_ancestor(repo_path, old_hash):
         log.info("Cached commit %s is no longer ancestor of HEAD, forcing full reindex", old_hash[:8])
         return None
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=ADMR", f"{old_hash}..{new_hash}", "--", "*.md"],
-            cwd=repo_path, capture_output=True, text=True, timeout=10,
-        )
+        cmd = ["git", "diff", "--name-only", "--diff-filter=ADMR", f"{old_hash}..{new_hash}",
+               "--"] + [f"*{ext}" for ext in file_types]
+        result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return None
         return [f for f in result.stdout.strip().splitlines() if f]
@@ -209,10 +210,10 @@ def reindex_source(
         old_hash = source_state.get("commit_hash")
         new_hash = _git_head(str(root))
         if old_hash and new_hash and old_hash != new_hash:
-            delta = _git_changed_files(str(root), old_hash, new_hash)
+            delta = _git_changed_files(str(root), old_hash, new_hash, source_cfg.file_types)
             if delta is not None:
                 changed_files = set(delta)
-                log.info("Git delta: %d changed .md files since %s", len(changed_files), old_hash[:8])
+                log.info("Git delta: %d changed files since %s", len(changed_files), old_hash[:8])
         elif old_hash == new_hash:
             # Check mtime as a fallback for uncommitted changes
             old_mtimes = source_state.get("mtimes", {})

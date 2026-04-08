@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from .tagger import (
+    OLLAMA_KEEP_ALIVE,
     OLLAMA_MODEL,
     OLLAMA_TIMEOUT,
     OLLAMA_URL,
@@ -267,6 +268,7 @@ def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
                 "messages": messages,
                 "stream": False,
                 "format": _DISTILL_SCHEMA,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
                 "options": {"temperature": 0.1, "num_predict": 2048},
             },
             timeout=OLLAMA_TIMEOUT,
@@ -349,6 +351,11 @@ def distill_transcript(
 
     new_turns = parse_turns(new_content, byte_offset)
     if not new_turns:
+        # Advance offset so we don't re-read the same trailing bytes
+        save_transcript_state(cache_dir, transcript_path, {
+            **state,
+            "byte_offset": len(content),
+        })
         return []
 
     # Re-number turns to continue from where we left off
@@ -448,10 +455,13 @@ def distill_all_transcripts(
         for txt_file in sorted(td_path.glob("*.txt")):
             state = load_transcript_state(cache_dir, str(txt_file))
             try:
-                mtime = txt_file.stat().st_mtime
+                stat = txt_file.stat()
+                mtime = stat.st_mtime
+                fsize = stat.st_size
             except OSError:
                 continue
-            if state.get("last_mtime") == mtime:
+            # Skip if mtime unchanged AND file hasn't grown past our offset
+            if state.get("last_mtime") == mtime and fsize <= state.get("byte_offset", 0):
                 continue
 
             new_chunks = distill_transcript(

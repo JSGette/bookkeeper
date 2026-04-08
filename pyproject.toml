@@ -20,6 +20,7 @@ all = ["treesitter-chunker>=0.4", "hnswlib>=0.8"]
 
 [project.scripts]
 agents-rag = "agents_rag.server:main"
+agents-rag-web = "agents_rag.web:main"
 
 [build-system]
 requires = ["setuptools>=68"]
