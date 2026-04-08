@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 code = ["treesitter-chunker>=0.4"]
 perf = ["hnswlib>=0.8"]
+test = ["pytest>=8.0"]
 all = ["treesitter-chunker>=0.4", "hnswlib>=0.8"]
 
 [project.scripts]

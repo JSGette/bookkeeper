@@ -135,6 +135,12 @@ _index_thread.start()
 
 mcp = FastMCP(name="agents-rag")
 
+
+def _flush_transcript_chunks(chunks: list[dict]) -> None:
+    """Enqueue transcript chunks for async embedding and index merge."""
+    _index_q.put(chunks)
+
+
 # Start background watcher if configured
 if transcript_dirs and watch_interval > 0:
     _watcher = TranscriptWatcher(
@@ -255,11 +261,6 @@ def reindex(source: str | None = None) -> str:
     t = threading.Thread(target=_reindex_worker, args=(source,), daemon=True, name="reindex")
     t.start()
     return json.dumps({"status": "started", "source": source or "all"})
-
-
-def _flush_transcript_chunks(chunks: list[dict]) -> None:
-    """Enqueue transcript chunks for async embedding and index merge."""
-    _index_q.put(chunks)
 
 
 @mcp.tool
