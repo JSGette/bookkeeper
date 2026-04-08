@@ -3,6 +3,7 @@ heuristic extraction and optional Gemma summarization. Runs as a background watc
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import json
 import logging
@@ -436,7 +437,7 @@ def distill_all_transcripts(
     output_dir: str,
     gemma_every_n: int = 3,
     use_gemma: bool = True,
-    flush_fn: callable | None = None,
+    flush_fn: Callable[[list[dict]], None] | None = None,
 ) -> int:
     """Scan all transcript dirs and distill incrementally.
 
@@ -495,8 +496,7 @@ class TranscriptWatcher:
         interval_minutes: float,
         gemma_every_n: int,
         use_gemma: bool,
-        searcher,
-        index_lock: threading.Lock,
+        flush_fn: Callable[[list[dict]], None],
     ):
         self.transcript_dirs = transcript_dirs
         self.cache_dir = cache_dir
@@ -504,8 +504,7 @@ class TranscriptWatcher:
         self.interval = interval_minutes * 60
         self.gemma_every_n = gemma_every_n
         self.use_gemma = use_gemma
-        self.searcher = searcher
-        self.index_lock = index_lock
+        self.flush_fn = flush_fn
         self._stop = threading.Event()
 
     def start(self) -> None:
@@ -525,32 +524,11 @@ class TranscriptWatcher:
             except Exception:
                 log.exception("Transcript watcher tick failed")
 
-    def _flush_chunks(self, chunks: list[dict]) -> None:
-        """Embed and merge chunks into the index immediately."""
-        from .indexer import embed_texts, load_index, save_index
-        import numpy as np
-
-        with self.index_lock:
-            texts = [c["text"] for c in chunks]
-            new_vecs = embed_texts(texts)
-
-            existing_vecs, existing_meta = load_index(self.cache_dir)
-            if existing_vecs is not None and existing_meta is not None:
-                merged_vecs = np.vstack([existing_vecs, new_vecs])
-                merged_meta = existing_meta + chunks
-            else:
-                merged_vecs = new_vecs
-                merged_meta = chunks
-
-            save_index(self.cache_dir, merged_vecs, merged_meta)
-            self.searcher.reload()
-            log.info("Flushed %d turn chunks to index", len(chunks))
-
     def _tick(self) -> None:
         total = distill_all_transcripts(
             self.transcript_dirs, self.cache_dir, self.output_dir,
             gemma_every_n=self.gemma_every_n, use_gemma=self.use_gemma,
-            flush_fn=self._flush_chunks,
+            flush_fn=self.flush_fn,
         )
         if total:
             log.info("Transcript watcher: %d total new turn chunks this tick", total)

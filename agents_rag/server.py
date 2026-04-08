@@ -144,8 +144,7 @@ if transcript_dirs and watch_interval > 0:
         interval_minutes=watch_interval,
         gemma_every_n=gemma_every_n,
         use_gemma=use_gemma,
-        searcher=searcher,
-        index_lock=index_lock,
+        flush_fn=_flush_transcript_chunks,
     )
     _watcher.start()
 
