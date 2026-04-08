@@ -8,9 +8,10 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# ~4 chars per token for rough estimation
-_CHARS_PER_TOKEN = 4
 _DEFAULT_MAX_CHUNK_TOKENS = 512
+
+# Lazy-loaded tiktoken encoder for accurate token counting
+_enc = None
 
 _MD_EXTENSIONS = {".md", ".mdx", ".markdown"}
 
@@ -59,7 +60,11 @@ def _should_skip(rel_path: str, skip_patterns: list[str]) -> bool:
 
 
 def _estimate_tokens(text: str) -> int:
-    return len(text) // _CHARS_PER_TOKEN
+    global _enc
+    if _enc is None:
+        import tiktoken
+        _enc = tiktoken.get_encoding("cl100k_base")
+    return len(_enc.encode(text))
 
 
 # ---------------------------------------------------------------------------
@@ -102,16 +107,15 @@ def _split_by_paragraphs(text: str, max_tokens: int) -> list[str]:
     chunks = []
     current: list[str] = []
     current_tokens = 0
-    overlap_chars = 50 * _CHARS_PER_TOKEN
+    max_overlap_tokens = 50
 
     for para in paragraphs:
         para_tokens = _estimate_tokens(para)
         if current_tokens + para_tokens > max_tokens and current:
             chunk_text = "\n\n".join(current)
             chunks.append(chunk_text)
-            # Keep last paragraph as overlap
             overlap = current[-1] if current else ""
-            current = [overlap] if _estimate_tokens(overlap) < overlap_chars // _CHARS_PER_TOKEN else []
+            current = [overlap] if _estimate_tokens(overlap) < max_overlap_tokens else []
             current_tokens = _estimate_tokens("\n\n".join(current))
         current.append(para)
         current_tokens += para_tokens
@@ -230,16 +234,18 @@ def _chunk_fixed_size(content: str, source: str, rel_path: str, max_tokens: int)
     """Fixed-size chunking with overlap for any file type."""
     doc_title = Path(rel_path).stem
     lines = content.splitlines()
-    max_chars = max_tokens * _CHARS_PER_TOKEN
     overlap_lines = 10
     chunks = []
 
     start = 0
     while start < len(lines):
         end = start
-        char_count = 0
-        while end < len(lines) and char_count + len(lines[end]) < max_chars:
-            char_count += len(lines[end]) + 1
+        token_count = 0
+        while end < len(lines):
+            line_tokens = _estimate_tokens(lines[end])
+            if token_count + line_tokens >= max_tokens:
+                break
+            token_count += line_tokens
             end += 1
         if end == start:
             end = start + 1
