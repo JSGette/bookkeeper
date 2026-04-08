@@ -147,6 +147,9 @@ def load_index(cache_dir: str) -> tuple[np.ndarray | None, list[dict] | None]:
     try:
         vectors = np.load(vec_path)["vectors"]
         metadata = json.loads(meta_path.read_text())
+        if len(vectors) != len(metadata):
+            log.error("Index corrupted: %d vectors vs %d metadata entries", len(vectors), len(metadata))
+            return None, None
         return vectors, metadata
     except Exception:
         return None, None
