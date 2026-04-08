@@ -1,0 +1,47 @@
+sources:
+  - name: personal
+    path: ~/REPOS/AGENTS
+    file_types: [.md]
+    skip:
+      - INDEX.md
+    generate_index: true
+
+  - name: repo
+    path: ~/REPOS/datadog-agent
+    file_types: [.md, .go, .py, .bzl, .bazel]
+    skip:
+      - "docs/cloud-workload-security/*"
+      - ".claude/skills/*"
+      - "tasks/libs/cws/templates/*"
+      - "vendor/*"
+      - ".git/*"
+    min_lines: 3
+    max_chunk_tokens: 512
+    generate_index: false
+
+sessions:
+  transcript_dirs:
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-agents-rag/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-datadog-agent/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-bazel-conduit/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-bazel-ui/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-bazel/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-rules-go/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-rules-cc/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-rules-foreign-cc/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-saluki/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-dd-source/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-gitlab-ci-ui/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-pixel-agents/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-cursor-skills-sidebar/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-static-quality-gates-report/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-ddamien-sandbox/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-experimental-teams-agent-supply-chain-go-migration-module-graph/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-datadog-agent-jose-dd-procmgrd-config-spawn/agent-transcripts
+  output_dir: ~/REPOS/AGENTS/sessions
+  gemma_every_n_turns: 3
+  watch_interval_minutes: 5
+
+model: all-MiniLM-L6-v2
+cache_dir: ~/.cache/agents-rag
+use_gemma: true
