@@ -243,14 +243,22 @@ def reindex_source(
                 if src_vecs_idx:
                     return src_meta, existing_vecs[src_vecs_idx], False
 
-    # Apply tagging
+    # Apply tagging (parallel when using LLM to avoid serial Ollama latency)
     overrides = load_overrides(source_cfg.path)
-    for chunk in all_chunks:
-        desc, tags = tag_file(
-            chunk.path, chunk.text, source_cfg.path, cache_dir, overrides, use_gemma=use_gemma,
-        )
-        chunk.description = desc
-        chunk.tags = tags
+
+    def _tag_one(chunk: Chunk) -> tuple[str, list[str]]:
+        return tag_file(chunk.path, chunk.text, source_cfg.path, cache_dir, overrides, use_gemma=use_gemma)
+
+    if use_gemma and len(all_chunks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(_tag_one, all_chunks))
+        for chunk, (desc, tags) in zip(all_chunks, results):
+            chunk.description = desc
+            chunk.tags = tags
+    else:
+        for chunk in all_chunks:
+            chunk.description, chunk.tags = _tag_one(chunk)
 
     # If delta reindex, reuse existing embeddings for unchanged files
     if changed_files is not None and changed_files:
