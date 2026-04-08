@@ -101,9 +101,22 @@ def _index_worker() -> None:
                 break
         try:
             with index_lock:
+                existing_vecs, existing_meta = load_index(cache_dir)
+                # Dedup: drop chunks already present in the index
+                if existing_meta:
+                    existing_keys = {
+                        (m["source"], m["path"], m.get("section_heading", ""))
+                        for m in existing_meta
+                    }
+                    batch = [
+                        c for c in batch
+                        if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
+                    ]
+                if not batch:
+                    log.info("Index queue: all chunks already present, skipping")
+                    continue
                 texts = [c["text"] for c in batch]
                 new_vecs = embed_texts(texts)
-                existing_vecs, existing_meta = load_index(cache_dir)
                 if existing_vecs is not None and existing_meta is not None:
                     merged_vecs = np.vstack([existing_vecs, new_vecs])
                     merged_meta = existing_meta + batch
