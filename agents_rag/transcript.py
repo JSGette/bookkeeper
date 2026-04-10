@@ -315,6 +315,22 @@ def tag_turn(turn: Turn, transcript_tags: list[str]) -> list[str]:
     return deduped[:10]
 
 
+def _format_session_summary(gemma_summary: dict) -> str:
+    """Format a Gemma summary dict as compact markdown for chunk metadata."""
+    parts: list[str] = []
+    if gemma_summary.get("summary"):
+        parts.append(gemma_summary["summary"])
+    if gemma_summary.get("decisions"):
+        parts.append("Decisions:")
+        for d in gemma_summary["decisions"]:
+            parts.append(f"- {d}")
+    if gemma_summary.get("next_steps"):
+        parts.append("Next steps:")
+        for s in gemma_summary["next_steps"]:
+            parts.append(f"- {s}")
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Incremental distillation orchestrator
 # ---------------------------------------------------------------------------
@@ -377,6 +393,7 @@ def distill_transcript(
     total_turns = turns_processed + len(new_turns)
     gemma_summary = None
     transcript_tags: list[str] = state.get("transcript_tags", [])
+    session_summary_text: str = state.get("gemma_summary_text", "")
 
     if use_gemma and (total_turns - gemma_summary_turn) >= gemma_every_n:
         # Parse all turns for full context
@@ -387,6 +404,7 @@ def distill_transcript(
         if gemma_summary:
             transcript_tags = gemma_summary.get("tags", [])
             gemma_summary_turn = total_turns
+            session_summary_text = _format_session_summary(gemma_summary)
 
     # Write summary file
     if turns_processed == 0:
@@ -404,7 +422,7 @@ def distill_transcript(
     new_chunks = []
     for turn in new_turns:
         turn_tags = tag_turn(turn, transcript_tags)
-        new_chunks.append({
+        chunk: dict = {
             "source": "sessions",
             "path": os.path.relpath(summary_path, os.path.expanduser(output_dir)),
             "doc_title": title,
@@ -415,7 +433,12 @@ def distill_transcript(
             "description": turn.user_query,
             "text": _turn_to_markdown(turn),
             "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
+            "full_session_path": summary_path,
+            "session_turn_count": total_turns,
+        }
+        if session_summary_text:
+            chunk["session_summary"] = session_summary_text
+        new_chunks.append(chunk)
 
     # Update state
     new_byte_offset = byte_offset + len(new_content)
@@ -426,6 +449,7 @@ def distill_transcript(
         "gemma_summary_turn": gemma_summary_turn,
         "title": title,
         "transcript_tags": transcript_tags,
+        "gemma_summary_text": session_summary_text,
     })
 
     return new_chunks

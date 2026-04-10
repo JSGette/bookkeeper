@@ -116,6 +116,7 @@ MINIMAL_SOURCE_CFG = {
     "min_lines": 0,
     "generate_index": False,
     "max_chunk_tokens": 512,
+    "max_whole_doc_tokens": 0,  # disabled in tests to preserve existing chunk-count assertions
 }
 
 

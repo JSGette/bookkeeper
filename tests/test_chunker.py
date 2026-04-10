@@ -36,7 +36,7 @@ def test_should_skip_no_match():
 # ---------------------------------------------------------------------------
 
 def test_markdown_sections(doc_tree: Path):
-    chunks = chunk_markdown("test", doc_tree, "guide.md", max_tokens=512)
+    chunks = chunk_markdown("test", doc_tree, "guide.md", max_tokens=512, max_whole_doc_tokens=0)
     headings = [c.section_heading for c in chunks]
     assert "Installation" in headings
     assert "Configuration" in headings
@@ -46,7 +46,7 @@ def test_markdown_sections(doc_tree: Path):
 
 def test_markdown_preamble(doc_tree: Path):
     """Content before the first ## becomes a preamble chunk."""
-    chunks = chunk_markdown("test", doc_tree, "guide.md", max_tokens=512)
+    chunks = chunk_markdown("test", doc_tree, "guide.md", max_tokens=512, max_whole_doc_tokens=0)
     preamble = [c for c in chunks if c.section_heading == ""]
     assert len(preamble) == 1
     assert "Introduction" in preamble[0].text
@@ -59,7 +59,7 @@ def test_markdown_empty_file(doc_tree: Path):
 
 def test_markdown_no_headings(doc_tree: Path):
     """A markdown file with no ## headings produces a single chunk."""
-    chunks = chunk_markdown("test", doc_tree, "sub/notes.md", max_tokens=512)
+    chunks = chunk_markdown("test", doc_tree, "sub/notes.md", max_tokens=512, max_whole_doc_tokens=0)
     assert len(chunks) == 1
     assert chunks[0].section_heading == ""
     assert "nested content" in chunks[0].text
@@ -77,8 +77,8 @@ def test_markdown_oversized_splits(tmp_path: Path):
     content = f"# Doc Title\n\n{big_section}"
     (tmp_path / "big.md").write_text(content)
 
-    # max_tokens=50 forces splitting (~200 chars)
-    chunks = chunk_markdown("test", tmp_path, "big.md", max_tokens=50)
+    # max_tokens=50 forces splitting; max_whole_doc_tokens=0 disables bypass
+    chunks = chunk_markdown("test", tmp_path, "big.md", max_tokens=50, max_whole_doc_tokens=0)
     assert len(chunks) > 1
     assert all(c.doc_title == "Doc Title" for c in chunks)
 
@@ -161,3 +161,18 @@ def test_embedding_text_without_heading():
     c = Chunk(source="s", path="p", doc_title="Title", section_heading="",
               start_line=1, end_line=5, text="body text")
     assert c.embedding_text == "Title\nbody text"
+
+
+def test_embedding_text_with_preamble():
+    c = Chunk(source="s", path="p", doc_title="Title", section_heading="Install",
+              start_line=1, end_line=5, text="body text",
+              doc_preamble="This doc covers installation and config.")
+    assert c.embedding_text == "Title | This doc covers installation and config. — Install\nbody text"
+
+
+def test_small_doc_bypass(doc_tree: Path):
+    """Documents under max_whole_doc_tokens are returned as a single chunk."""
+    chunks = chunk_markdown("test", doc_tree, "guide.md", max_tokens=512, max_whole_doc_tokens=5000)
+    assert len(chunks) == 1
+    assert "Installation" in chunks[0].text
+    assert "Configuration" in chunks[0].text

@@ -56,6 +56,7 @@ def _parse_sources(config: dict) -> list[SourceConfig]:
             generate_index=s.get("generate_index", False),
             file_types=s.get("file_types", [".md"]),
             max_chunk_tokens=s.get("max_chunk_tokens", 512),
+            max_whole_doc_tokens=s.get("max_whole_doc_tokens", 1500),
         ))
     return sources
 
@@ -84,10 +85,17 @@ call `save_session` with a structured summary: title, what was done, key decisio
 files touched, and next steps. This lets the next chat resume without re-discovering context.
 9. Previous chat sessions are automatically indexed in the background. When starting new \
 work, `query_knowledge_base` will surface prior session notes alongside documentation.
-10. Some results include `text_preview` instead of full `text` when the chunk is large. \
+10. **Session results** contain a `session_summary` field with the Gemma-distilled overview \
+(summary, decisions, next steps) instead of raw turn text. Multiple matching turns from the \
+same session are collapsed into one result; `matched_turns` shows which turns triggered the \
+match. If the summary is relevant and you need full context, call `get_full_session` with \
+the `full_session_path` from the result.
+11. Some non-session results include a `doc_context` field — a brief preamble from the \
+document's introduction. Use it to understand the chunk's position in the document before \
+deciding whether to read the full file.
+12. Some results include `text_preview` instead of full `text` when the chunk is large. \
 If the preview looks relevant, use the `path`, `start_line`, and `end_line` fields to \
-read the original file directly (e.g., via the Read tool). For session chunks where the \
-path is a generated summary, the preview is usually sufficient context.
+read the original file directly (e.g., via the Read tool).
 """
 
 
@@ -114,7 +122,8 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     gemma_every_n = sessions_config.get("gemma_every_n_turns", 3)
     watch_interval = sessions_config.get("watch_interval_minutes", 5)
 
-    searcher = Searcher(cache_dir)
+    source_roots = {src.name: src.path for src in sources}
+    searcher = Searcher(cache_dir, source_roots=source_roots)
     index_lock = threading.Lock()
 
     # Index queue — serialises all embed-merge-save-reload work on a single thread
@@ -392,6 +401,24 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             "status": "queued",
             "path": filepath,
         })
+
+    @mcp.tool
+    def get_full_session(path: str) -> str:
+        """Read the full session transcript summary. Use when a session result
+        from query_knowledge_base needs deeper context.
+
+        Args:
+            path: The full_session_path from a session query result.
+        """
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(sessions_output_dir) / path
+        if not p.exists():
+            return json.dumps({"error": f"Session file not found: {p}"})
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return json.dumps({"error": str(exc)})
 
     @mcp.tool
     def deprecate_doc(path: str, reason: str = "", undeprecate: bool = False) -> str:

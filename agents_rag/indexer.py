@@ -25,7 +25,7 @@ def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        model_name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
         _model = SentenceTransformer(model_name)
     return _model
 
@@ -340,7 +340,7 @@ def reindex_source(
 
 
 def _chunk_to_meta(c: Chunk) -> dict:
-    return {
+    meta: dict = {
         "source": c.source,
         "path": c.path,
         "doc_title": c.doc_title,
@@ -352,6 +352,9 @@ def _chunk_to_meta(c: Chunk) -> dict:
         "text": c.text,
         "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if c.doc_preamble:
+        meta["doc_preamble"] = c.doc_preamble
+    return meta
 
 
 def _update_state(

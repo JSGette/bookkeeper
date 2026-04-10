@@ -17,7 +17,10 @@ from .indexer import embed_texts, load_index
 log = logging.getLogger(__name__)
 
 MAX_INLINE_LINES = 50
+MAX_GROUP_TOKENS = 2048
 RRF_K = 60  # RRF constant — 60 is the standard default
+
+_CHARS_PER_TOKEN = 4  # rough estimate for grouping cap
 
 
 def _deprecated_path(cache_dir: str) -> Path:
@@ -47,8 +50,9 @@ def _tokenize(text: str) -> list[str]:
 
 
 class Searcher:
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir: str, source_roots: dict[str, str] | None = None):
         self.cache_dir = cache_dir
+        self.source_roots = source_roots or {}
         self._vectors: np.ndarray | None = None
         self._metadata: list[dict] | None = None
         self._bm25: BM25Okapi | None = None
@@ -210,14 +214,45 @@ class Searcher:
                 fused_indices = [max(rrf_scores, key=rrf_scores.get)]
 
         results = []
+        session_groups: dict[str, dict] = {}  # path -> merged result
+
         for idx in fused_indices:
             meta = self._metadata[idx]
             text = meta.get("text", "")
-            line_count = text.count("\n") + 1
-
             doc_path = meta.get("path", "")
-            result = {
-                "source": meta.get("source", ""),
+            source = meta.get("source", "")
+
+            # Session chunks: group by path and return distilled summary
+            if source == "sessions":
+                turn_label = meta.get("section_heading", "")
+                if doc_path in session_groups:
+                    group = session_groups[doc_path]
+                    group["matched_turns"].append(turn_label)
+                    group["score"] = max(group["score"], round(rrf_scores[idx], 4))
+                    continue
+
+                session_groups[doc_path] = {
+                    "source": "sessions",
+                    "path": doc_path,
+                    "score": round(rrf_scores[idx], 4),
+                    "tags": meta.get("tags", []),
+                    "description": meta.get("doc_title", ""),
+                    "indexed_at": meta.get("indexed_at", ""),
+                    "matched_turns": [turn_label],
+                    "full_session_path": meta.get("full_session_path", ""),
+                    "session_turn_count": meta.get("session_turn_count", 0),
+                }
+                summary = meta.get("session_summary", "")
+                if summary:
+                    session_groups[doc_path]["session_summary"] = summary
+                else:
+                    session_groups[doc_path]["text"] = text
+                continue
+
+            # Non-session chunks: standard result building
+            line_count = text.count("\n") + 1
+            result: dict = {
+                "source": source,
                 "path": doc_path,
                 "section": meta.get("section_heading", ""),
                 "score": round(rrf_scores[idx], 4),
@@ -225,6 +260,10 @@ class Searcher:
                 "description": meta.get("description", ""),
                 "indexed_at": meta.get("indexed_at", ""),
             }
+
+            doc_context = meta.get("doc_preamble", "")
+            if doc_context:
+                result["doc_context"] = doc_context
 
             deprecation_reason = self._deprecated.get(doc_path)
             if deprecation_reason:
@@ -243,4 +282,83 @@ class Searcher:
 
             results.append(result)
 
+        # Group non-session results from the same document
+        results = self._group_document_results(results)
+
+        # Insert session results and sort everything by score
+        for group in session_groups.values():
+            results.append(group)
+        results.sort(key=lambda r: r.get("score", 0), reverse=True)
+
         return results
+
+    def _group_document_results(self, results: list[dict]) -> list[dict]:
+        """Merge multiple results from the same file into one contiguous block."""
+        if not self.source_roots:
+            return results
+
+        groups: dict[tuple[str, str], list[dict]] = {}
+        singles: list[dict] = []
+
+        for r in results:
+            key = (r.get("source", ""), r.get("path", ""))
+            groups.setdefault(key, []).append(r)
+
+        merged: list[dict] = []
+        for (src, path), items in groups.items():
+            if len(items) == 1:
+                merged.append(items[0])
+                continue
+
+            root = self.source_roots.get(src)
+            if not root:
+                merged.extend(items)
+                continue
+
+            items.sort(key=lambda r: r.get("start_line", 0))
+            first_line = min(r.get("start_line", 0) for r in items if r.get("start_line"))
+            last_line = max(r.get("end_line", 0) for r in items if r.get("end_line"))
+
+            if not first_line or not last_line:
+                merged.extend(items)
+                continue
+
+            # Read the file range between first and last matching chunk
+            full_path = Path(root) / path
+            try:
+                all_lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                merged.extend(items)
+                continue
+
+            slice_text = "\n".join(all_lines[first_line - 1 : last_line])
+            est_tokens = len(slice_text) // _CHARS_PER_TOKEN
+            if est_tokens > MAX_GROUP_TOKENS:
+                merged.extend(items)
+                continue
+
+            best = max(items, key=lambda r: r.get("score", 0))
+            merged_result: dict = {
+                "source": src,
+                "path": path,
+                "section": ", ".join(
+                    r["section"] for r in items if r.get("section")
+                ),
+                "score": best["score"],
+                "tags": best.get("tags", []),
+                "description": best.get("description", ""),
+                "indexed_at": best.get("indexed_at", ""),
+                "start_line": first_line,
+                "end_line": last_line,
+                "text": slice_text,
+                "merged_chunks": len(items),
+            }
+            if best.get("doc_context"):
+                merged_result["doc_context"] = best["doc_context"]
+            dep = best.get("deprecation_notice")
+            if dep:
+                merged_result["deprecated"] = True
+                merged_result["deprecation_notice"] = dep
+            merged.append(merged_result)
+
+        return merged

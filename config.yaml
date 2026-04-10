@@ -42,6 +42,6 @@ sessions:
   gemma_every_n_turns: 3
   watch_interval_minutes: 5
 
-model: all-MiniLM-L6-v2
+model: BAAI/bge-small-en-v1.5
 cache_dir: ~/.cache/agents-rag
 use_gemma: true

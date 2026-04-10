@@ -33,12 +33,19 @@ class Chunk:
     text: str
     tags: list[str] = field(default_factory=list)
     description: str = ""
+    doc_preamble: str = ""
 
     @property
     def embedding_text(self) -> str:
+        prefix = self.doc_title
+        if self.doc_preamble:
+            prefix += f" | {self.doc_preamble[:200]}"
         if self.section_heading and self.section_heading != self.doc_title:
-            return f"{self.doc_title} — {self.section_heading}\n{self.text}"
-        return f"{self.doc_title}\n{self.text}"
+            prefix += f" — {self.section_heading}"
+        return f"{prefix}\n{self.text}"
+
+
+_DEFAULT_MAX_WHOLE_DOC_TOKENS = 1500
 
 
 @dataclass
@@ -50,6 +57,7 @@ class SourceConfig:
     generate_index: bool = False
     file_types: list[str] = field(default_factory=lambda: [".md"])
     max_chunk_tokens: int = _DEFAULT_MAX_CHUNK_TOKENS
+    max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS
 
 
 def _should_skip(rel_path: str, skip_patterns: list[str]) -> bool:
@@ -125,7 +133,10 @@ def _split_by_paragraphs(text: str, max_tokens: int) -> list[str]:
     return chunks or [text]
 
 
-def chunk_markdown(source: str, root: Path, rel_path: str, max_tokens: int) -> list[Chunk]:
+def chunk_markdown(
+    source: str, root: Path, rel_path: str, max_tokens: int,
+    max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS,
+) -> list[Chunk]:
     full_path = root / rel_path
     try:
         content = full_path.read_text(encoding="utf-8", errors="replace")
@@ -138,11 +149,28 @@ def chunk_markdown(source: str, root: Path, rel_path: str, max_tokens: int) -> l
 
     doc_title = _extract_title(lines) or Path(rel_path).stem
 
+    # Small-document bypass: return whole doc as a single chunk
+    if max_whole_doc_tokens > 0 and _estimate_tokens(content) <= max_whole_doc_tokens:
+        return [Chunk(
+            source=source, path=rel_path, doc_title=doc_title,
+            section_heading="", start_line=1, end_line=len(lines),
+            text=content.strip(),
+        )]
+
     sections: list[tuple[str, int]] = []
     for i, line in enumerate(lines):
         if re.match(r"^##\s+", line):
             heading = re.sub(r"^##\s+", "", line).strip()
             sections.append((heading, i))
+
+    # Extract preamble: text between # title and first ## heading (or end of doc)
+    preamble = ""
+    if sections and sections[0][1] > 0:
+        raw = "\n".join(lines[: sections[0][1]]).strip()
+        # Strip the title line itself, keep remaining text
+        preamble_lines_raw = raw.split("\n", 1)
+        if len(preamble_lines_raw) > 1:
+            preamble = preamble_lines_raw[1].strip()
 
     chunks = []
 
@@ -151,7 +179,7 @@ def chunk_markdown(source: str, root: Path, rel_path: str, max_tokens: int) -> l
             chunks.append(Chunk(
                 source=source, path=rel_path, doc_title=doc_title,
                 section_heading="", start_line=1, end_line=len(lines),
-                text=part,
+                text=part, doc_preamble=preamble,
             ))
         return chunks
 
@@ -163,7 +191,7 @@ def chunk_markdown(source: str, root: Path, rel_path: str, max_tokens: int) -> l
                 chunks.append(Chunk(
                     source=source, path=rel_path, doc_title=doc_title,
                     section_heading="", start_line=1, end_line=sections[0][1],
-                    text=part,
+                    text=part, doc_preamble=preamble,
                 ))
 
     for idx, (heading, start) in enumerate(sections):
@@ -175,7 +203,7 @@ def chunk_markdown(source: str, root: Path, rel_path: str, max_tokens: int) -> l
             chunks.append(Chunk(
                 source=source, path=rel_path, doc_title=doc_title,
                 section_heading=heading, start_line=start + 1, end_line=end,
-                text=part,
+                text=part, doc_preamble=preamble,
             ))
 
     return chunks
@@ -266,11 +294,15 @@ def _chunk_fixed_size(content: str, source: str, rel_path: str, max_tokens: int)
 # Entry points
 # ---------------------------------------------------------------------------
 
-def chunk_file(source: str, root: Path, rel_path: str, max_tokens: int = _DEFAULT_MAX_CHUNK_TOKENS) -> list[Chunk]:
+def chunk_file(
+    source: str, root: Path, rel_path: str,
+    max_tokens: int = _DEFAULT_MAX_CHUNK_TOKENS,
+    max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS,
+) -> list[Chunk]:
     """Chunk a single file, dispatching by extension."""
     ext = Path(rel_path).suffix.lower()
     if ext in _MD_EXTENSIONS:
-        return chunk_markdown(source, root, rel_path, max_tokens)
+        return chunk_markdown(source, root, rel_path, max_tokens, max_whole_doc_tokens)
     elif ext in _CODE_EXTENSIONS:
         return chunk_code(source, root, rel_path, max_tokens)
     else:
@@ -307,6 +339,9 @@ def chunk_source(source_cfg: SourceConfig) -> list[Chunk]:
                 continue
             if line_count < source_cfg.min_lines:
                 continue
-        all_chunks.extend(chunk_file(source_cfg.name, root, rel, source_cfg.max_chunk_tokens))
+        all_chunks.extend(chunk_file(
+            source_cfg.name, root, rel, source_cfg.max_chunk_tokens,
+            source_cfg.max_whole_doc_tokens,
+        ))
 
     return all_chunks
