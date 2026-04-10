@@ -77,9 +77,9 @@ class Handler(SimpleHTTPRequestHandler):
         if meta is None:
             self._json_response({"error": "No index found. Run reindex first."}, 404)
             return
-        # Strip text field to reduce payload — keep a truncated preview
-        for m in meta:
-            text = m.pop("text", "")
+        texts = _read_json(Path(self.cache_dir) / "texts.json") or []
+        for i, m in enumerate(meta):
+            text = texts[i] if i < len(texts) else m.pop("text", "")
             m["preview"] = text[:200] if text else ""
         self._json_response(meta)
 

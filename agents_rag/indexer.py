@@ -138,10 +138,13 @@ def _index_dir(cache_dir: str) -> Path:
     return Path(cache_dir)
 
 
-def load_index(cache_dir: str) -> tuple[np.ndarray | None, list[dict] | None]:
+def load_index(
+    cache_dir: str, *, include_texts: bool = True,
+) -> tuple[np.ndarray | None, list[dict] | None]:
     idx_dir = _index_dir(cache_dir)
     vec_path = idx_dir / "index.npz"
     meta_path = idx_dir / "chunks.json"
+    texts_path = idx_dir / "texts.json"
     if not vec_path.exists() or not meta_path.exists():
         return None, None
     try:
@@ -150,6 +153,15 @@ def load_index(cache_dir: str) -> tuple[np.ndarray | None, list[dict] | None]:
         if len(vectors) != len(metadata):
             log.error("Index corrupted: %d vectors vs %d metadata entries", len(vectors), len(metadata))
             return None, None
+        if include_texts:
+            if texts_path.exists():
+                texts = json.loads(texts_path.read_text())
+                if len(texts) == len(metadata):
+                    for m, t in zip(metadata, texts):
+                        m["text"] = t
+                else:
+                    log.warning("texts.json length mismatch (%d vs %d), ignoring", len(texts), len(metadata))
+            # else: old-format index with text inlined in chunks.json — works as-is
         return vectors, metadata
     except Exception:
         return None, None
@@ -178,7 +190,13 @@ def save_index(cache_dir: str, vectors: np.ndarray, metadata: list[dict]) -> Non
     idx_dir = _index_dir(cache_dir)
     idx_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(idx_dir / "index.npz", vectors=vectors)
+    # Split text out of metadata to keep chunks.json lean
+    texts = [m.pop("text", "") for m in metadata]
     (idx_dir / "chunks.json").write_text(json.dumps(metadata, indent=2))
+    (idx_dir / "texts.json").write_text(json.dumps(texts))
+    # Restore text on the dicts so callers still see it
+    for m, t in zip(metadata, texts):
+        m["text"] = t
     _save_hnsw(idx_dir, vectors)
 
 

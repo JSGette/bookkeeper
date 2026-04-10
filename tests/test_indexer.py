@@ -73,14 +73,34 @@ def test_save_load_roundtrip(tmp_cache: str):
         {"source": "test", "path": "c.md", "text": "foo"},
     ]
     save_index(tmp_cache, vecs, meta)
-    loaded_vecs, loaded_meta = load_index(tmp_cache)
 
+    # texts.json should exist separately from chunks.json
+    idx_dir = Path(tmp_cache)
+    assert (idx_dir / "texts.json").exists()
+    stored_meta = json.loads((idx_dir / "chunks.json").read_text())
+    assert "text" not in stored_meta[0], "chunks.json should not contain text"
+
+    loaded_vecs, loaded_meta = load_index(tmp_cache)
     assert loaded_vecs is not None
     assert loaded_meta is not None
     assert loaded_vecs.shape == vecs.shape
     assert np.allclose(loaded_vecs, vecs, atol=1e-5)
     assert len(loaded_meta) == 3
     assert loaded_meta[0]["path"] == "a.md"
+    assert loaded_meta[0]["text"] == "hello"
+
+
+def test_load_index_without_texts(tmp_cache: str):
+    """include_texts=False returns metadata without text field."""
+    vecs = np.random.randn(2, 384).astype(np.float32)
+    meta = [
+        {"source": "test", "path": "a.md", "text": "hello"},
+        {"source": "test", "path": "b.md", "text": "world"},
+    ]
+    save_index(tmp_cache, vecs, meta)
+    _, loaded_meta = load_index(tmp_cache, include_texts=False)
+    assert loaded_meta is not None
+    assert "text" not in loaded_meta[0]
 
 
 def test_load_missing_index(tmp_cache: str):
@@ -97,13 +117,14 @@ def test_load_index_corrupted(tmp_cache: str):
     """Mismatched vector and metadata counts should return (None, None)."""
     vecs = np.random.randn(3, 384).astype(np.float32)
     meta = [
-        {"source": "test", "path": "a.md", "text": "hello"},
-        {"source": "test", "path": "b.md", "text": "world"},
+        {"source": "test", "path": "a.md"},
+        {"source": "test", "path": "b.md"},
     ]
-    # Write vectors and metadata with different lengths
+    texts = ["hello", "world"]
     idx_dir = Path(tmp_cache)
     np.savez_compressed(idx_dir / "index.npz", vectors=vecs)
     (idx_dir / "chunks.json").write_text(json.dumps(meta))
+    (idx_dir / "texts.json").write_text(json.dumps(texts))
 
     loaded_vecs, loaded_meta = load_index(tmp_cache)
     assert loaded_vecs is None
