@@ -86,8 +86,9 @@ CREATE TABLE IF NOT EXISTS query_log (
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the database and ensure schema exists."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
     _migrate(conn)
