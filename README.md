@@ -5,7 +5,7 @@ MCP server for semantic search over local documentation, source code, and chat s
 ## Architecture
 
 ```
-Documents/Code → Chunker → Tagger → Embedder (MiniLM) → Vector index
+Documents/Code → Chunker → Tagger → Embedder (BGE) → Vector index
                      ↓                                        ↑
               Doc Summarizer (Gemma) → documents.summary      │
                                                               │
@@ -22,8 +22,8 @@ Transcripts → Background Watcher → Turn Parser → Gemma Summarizer → Sess
 |--------|---------|
 | `chunker.py` | Multi-format chunking: markdown at `##` headings, source code via treesitter (optional) or fixed-size, with a configurable token ceiling |
 | `tagger.py` | Three-layer tagging: path-based → LLM via Ollama (cached) → manual `.agents-rag-meta.yaml` overrides. Prompt and examples are configurable |
-| `indexer.py` | Embeds chunks with `all-MiniLM-L6-v2`, generates document-level summaries via Gemma, persists to SQLite. Git-based delta reindex, mtime fallback. Optional HNSW for large corpora |
-| `searcher.py` | Hybrid BM25 + vector cosine search fused via RRF. Returns document summaries + pointers instead of raw chunks. Configurable score-gap filtering and freshness boost |
+| `indexer.py` | Embeds chunks with `BAAI/bge-small-en-v1.5`, generates document-level summaries via Gemma, persists to SQLite. Git-based delta reindex with mtime fallback |
+| `searcher.py` | Hybrid BM25 + vector cosine search fused via RRF. Returns document summaries + pointers instead of raw chunks. Configurable score-gap filtering, freshness boost, and optional HNSW for large corpora |
 | `transcript.py` | Parses Cursor agent transcripts into turn-level chunks with heuristic extraction and optional Gemma summarization. Background watcher flushes each transcript to the index immediately |
 | `index_generator.py` | Regenerates `INDEX.md` for sources with `generate_index: true` |
 | `db.py` | SQLite storage backend: documents (with summaries), chunks, vectors, state, and query audit log |
@@ -100,7 +100,7 @@ search:
   score_threshold_z: 0.8        # z-score multiplier for result filtering (default 0.8)
   min_results: 2                # minimum results returned per query (default 2)
 
-model: all-MiniLM-L6-v2
+model: BAAI/bge-small-en-v1.5
 cache_dir: ~/.cache/agents-rag
 use_gemma: true
 
@@ -165,7 +165,7 @@ starting context instead of re-scanning the codebase.
 Two retrieval paths fused via Reciprocal Rank Fusion (RRF, k=60):
 
 1. **BM25** — keyword matching via `rank-bm25`
-2. **Vector cosine** — semantic matching via `all-MiniLM-L6-v2`
+2. **Vector cosine** — semantic matching via `BAAI/bge-small-en-v1.5` (configurable via `EMBEDDING_MODEL` env var)
 
 Post-fusion: score-gap filtering (configurable z-score threshold, default 0.8σ) removes noise while guaranteeing at least `min_results` (default 2). Freshness boost (time-decay over ~1 week) promotes recent docs. For corpora >5000 chunks, optional `hnswlib` provides sub-ms ANN search.
 
@@ -229,4 +229,4 @@ The UI loads all metadata client-side and filters by keyword (path, title, headi
 | `tiktoken` | Token counting |
 
 **Optional:** `treesitter-chunker` (code chunking), `hnswlib` (ANN search).
-**Runtime:** Ollama with an LLM (for semantic tagging and transcript summarization).
+**Runtime:** Ollama with an LLM (for semantic tagging, document summarization, and transcript distillation).
