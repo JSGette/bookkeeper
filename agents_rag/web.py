@@ -48,6 +48,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._serve_chunks()
         elif self.path == "/api/stats":
             self._serve_stats()
+        elif self.path.startswith("/api/queries"):
+            self._serve_queries()
         else:
             self.send_error(404)
 
@@ -103,6 +105,14 @@ class Handler(SimpleHTTPRequestHandler):
             "tags": dict(tag_counts.most_common(200)),
             "deprecated": len(deprecated),
         })
+
+    def _serve_queries(self) -> None:
+        conn = self.get_conn()
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        limit = int(qs.get("limit", ["50"])[0])
+        entries = db.get_recent_queries(conn, limit=limit)
+        self._json_response(entries)
 
     def log_message(self, format, *args):  # noqa: A002
         log.info(format, *args)

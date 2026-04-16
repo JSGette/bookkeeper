@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import logging
 import math
 import re
@@ -20,11 +19,7 @@ from .indexer import embed_texts
 
 log = logging.getLogger(__name__)
 
-MAX_INLINE_LINES = 50
-MAX_GROUP_TOKENS = 2048
 RRF_K = 60
-
-_CHARS_PER_TOKEN = 4
 
 
 def _tokenize(text: str) -> list[str]:
@@ -196,6 +191,8 @@ class Searcher:
         query_text: str,
         top_k: int = 5,
         source: str | None = None,
+        score_threshold_z: float = 0.8,
+        min_results: int = 2,
     ) -> list[dict]:
         if self._vectors is None or self._metadata is None or len(self._metadata) == 0:
             return []
@@ -218,10 +215,14 @@ class Searcher:
 
         if len(fused_indices) > 1:
             scores_arr = np.array([rrf_scores[i] for i in fused_indices])
-            threshold = scores_arr.mean() + 1.5 * scores_arr.std()
-            fused_indices = [i for i in fused_indices if rrf_scores[i] >= threshold]
-            if not fused_indices:
-                fused_indices = [max(rrf_scores, key=rrf_scores.get)]
+            threshold = scores_arr.mean() + score_threshold_z * scores_arr.std()
+            filtered = [i for i in fused_indices if rrf_scores[i] >= threshold]
+            # Guarantee at least min_results (or all candidates if fewer exist)
+            if len(filtered) < min(min_results, len(fused_indices)):
+                filtered = sorted(fused_indices, key=lambda i: rrf_scores[i], reverse=True)[
+                    :min(min_results, len(fused_indices))
+                ]
+            fused_indices = filtered
 
         results = []
         session_groups: dict[str, dict] = {}
@@ -258,20 +259,24 @@ class Searcher:
                     session_groups[doc_path]["text"] = text
                 continue
 
-            line_count = text.count("\n") + 1
             result: dict = {
                 "source": src,
                 "path": doc_path,
-                "section": meta.get("section_heading", ""),
                 "score": round(rrf_scores[idx], 4),
                 "tags": meta.get("tags", []),
                 "description": meta.get("description", ""),
                 "indexed_at": meta.get("indexed_at", ""),
+                "matched_sections": [meta.get("section_heading", "")],
+                "start_line": meta.get("start_line", 0),
+                "end_line": meta.get("end_line", 0),
             }
 
-            doc_context = meta.get("doc_preamble", "")
-            if doc_context:
-                result["doc_context"] = doc_context
+            doc_summary = meta.get("doc_summary", "")
+            if doc_summary:
+                result["summary"] = doc_summary
+            else:
+                doc_context = meta.get("doc_preamble", "")
+                result["summary"] = doc_context or text[:500]
 
             deprecation_reason = self._deprecated.get(doc_path)
             if deprecation_reason:
@@ -280,13 +285,6 @@ class Searcher:
                     f"HISTORICAL CONTEXT ONLY — this doc has been marked as outdated: "
                     f"{deprecation_reason}. Do not treat claims in this doc as current facts."
                 )
-
-            if line_count <= MAX_INLINE_LINES:
-                result["text"] = text
-            else:
-                result["text_preview"] = text[:500] + "..."
-                result["start_line"] = meta.get("start_line", 0)
-                result["end_line"] = meta.get("end_line", 0)
 
             results.append(result)
 
@@ -299,7 +297,7 @@ class Searcher:
         return results
 
     def _group_document_results(self, results: list[dict]) -> list[dict]:
-        """Merge multiple results from the same file into one contiguous block."""
+        """Merge multiple results from the same file into one result with combined sections."""
         groups: dict[tuple[str, str], list[dict]] = {}
 
         for r in results:
@@ -307,50 +305,34 @@ class Searcher:
             groups.setdefault(key, []).append(r)
 
         merged: list[dict] = []
-        for (src, path), items in groups.items():
+        for (_src, _path), items in groups.items():
             if len(items) == 1:
                 merged.append(items[0])
                 continue
 
-            # Read full doc content from DB
-            content = db.get_document_content(self.conn, src, path)
-            if not content:
-                merged.extend(items)
-                continue
-
-            items.sort(key=lambda r: r.get("start_line", 0))
-            first_line = min(r.get("start_line", 0) for r in items if r.get("start_line"))
-            last_line = max(r.get("end_line", 0) for r in items if r.get("end_line"))
-
-            if not first_line or not last_line:
-                merged.extend(items)
-                continue
-
-            all_lines = content.splitlines()
-            slice_text = "\n".join(all_lines[first_line - 1 : last_line])
-            est_tokens = len(slice_text) // _CHARS_PER_TOKEN
-            if est_tokens > MAX_GROUP_TOKENS:
-                merged.extend(items)
-                continue
-
             best = max(items, key=lambda r: r.get("score", 0))
+            all_sections = []
+            for r in items:
+                for s in r.get("matched_sections", []):
+                    if s and s not in all_sections:
+                        all_sections.append(s)
+
+            first_line = min((r.get("start_line") or 0) for r in items) or 0
+            last_line = max((r.get("end_line") or 0) for r in items) or 0
+
             merged_result: dict = {
-                "source": src,
-                "path": path,
-                "section": ", ".join(
-                    r["section"] for r in items if r.get("section")
-                ),
+                "source": _src,
+                "path": _path,
                 "score": best["score"],
                 "tags": best.get("tags", []),
                 "description": best.get("description", ""),
                 "indexed_at": best.get("indexed_at", ""),
+                "summary": best.get("summary", ""),
+                "matched_sections": all_sections,
                 "start_line": first_line,
                 "end_line": last_line,
-                "text": slice_text,
                 "merged_chunks": len(items),
             }
-            if best.get("doc_context"):
-                merged_result["doc_context"] = best["doc_context"]
             dep = best.get("deprecation_notice")
             if dep:
                 merged_result["deprecated"] = True

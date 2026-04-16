@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS documents (
     title TEXT NOT NULL DEFAULT '',
     preamble TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
     indexed_at TEXT NOT NULL,
     UNIQUE(source, path)
 );
@@ -64,6 +65,17 @@ CREATE TABLE IF NOT EXISTS hnsw_cache (
     chunk_count INTEGER NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS query_log (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    query TEXT NOT NULL,
+    source_filter TEXT,
+    top_k INTEGER NOT NULL,
+    result_count INTEGER NOT NULL,
+    results_json TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL
+);
 """
 
 
@@ -78,8 +90,17 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns/tables introduced after initial schema."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    if "summary" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+        log.info("Migrated: added documents.summary column")
 
 
 # ---------------------------------------------------------------------------
@@ -93,19 +114,20 @@ def upsert_document(
     title: str,
     preamble: str,
     content: str,
+    summary: str = "",
 ) -> int:
     conn.execute(
-        """INSERT INTO documents (source, path, title, preamble, content, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+        """INSERT INTO documents (source, path, title, preamble, content, summary, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(source, path) DO UPDATE SET
                title=excluded.title,
                preamble=excluded.preamble,
                content=excluded.content,
+               summary=excluded.summary,
                indexed_at=excluded.indexed_at""",
-        (source, path, title, preamble, content, _now()),
+        (source, path, title, preamble, content, summary, _now()),
     )
     conn.commit()
-    # lastrowid is unreliable on ON CONFLICT UPDATE, fetch explicitly
     row = conn.execute(
         "SELECT id FROM documents WHERE source=? AND path=?", (source, path),
     ).fetchone()
@@ -122,6 +144,13 @@ def get_document_id(conn: sqlite3.Connection, source: str, path: str) -> int | N
 def get_document_content(conn: sqlite3.Connection, source: str, path: str) -> str | None:
     row = conn.execute(
         "SELECT content FROM documents WHERE source=? AND path=?", (source, path),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_document_summary(conn: sqlite3.Connection, source: str, path: str) -> str | None:
+    row = conn.execute(
+        "SELECT summary FROM documents WHERE source=? AND path=?", (source, path),
     ).fetchone()
     return row[0] if row else None
 
@@ -176,25 +205,22 @@ def load_all_chunks(
     source: str | None = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Load all chunk metadata and vectors. Returns (metadata_list, vector_matrix)."""
+    _cols = """\
+            c.id, d.source, d.path, d.title, c.section_heading,
+            c.start_line, c.end_line, c.text, c.tags, c.description,
+            c.doc_preamble, c.indexed_at, c.vector,
+            c.session_summary, c.full_session_path, c.session_turn_count,
+            d.summary"""
     if source:
         rows = conn.execute(
-            """SELECT c.id, d.source, d.path, d.title, c.section_heading,
-                      c.start_line, c.end_line, c.text, c.tags, c.description,
-                      c.doc_preamble, c.indexed_at, c.vector,
-                      c.session_summary, c.full_session_path, c.session_turn_count
-               FROM chunks c JOIN documents d ON c.doc_id = d.id
-               WHERE d.source = ?
-               ORDER BY c.id""",
+            f"SELECT {_cols} FROM chunks c JOIN documents d ON c.doc_id = d.id"
+            " WHERE d.source = ? ORDER BY c.id",
             (source,),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT c.id, d.source, d.path, d.title, c.section_heading,
-                      c.start_line, c.end_line, c.text, c.tags, c.description,
-                      c.doc_preamble, c.indexed_at, c.vector,
-                      c.session_summary, c.full_session_path, c.session_turn_count
-               FROM chunks c JOIN documents d ON c.doc_id = d.id
-               ORDER BY c.id""",
+            f"SELECT {_cols} FROM chunks c JOIN documents d ON c.doc_id = d.id"
+            " ORDER BY c.id",
         ).fetchall()
 
     metadata: list[dict] = []
@@ -221,6 +247,8 @@ def load_all_chunks(
             meta["full_session_path"] = row[14]
         if row[15] is not None:
             meta["session_turn_count"] = row[15]
+        if row[16]:
+            meta["doc_summary"] = row[16]
         metadata.append(meta)
         vectors.append(np.frombuffer(row[12], dtype=np.float32))
 
@@ -373,6 +401,45 @@ def save_transcript_state(conn: sqlite3.Connection, transcript_path: str, state:
         (h, json.dumps(state)),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Query audit log
+# ---------------------------------------------------------------------------
+
+def log_query(
+    conn: sqlite3.Connection,
+    query: str,
+    source_filter: str | None,
+    top_k: int,
+    result_count: int,
+    results_json: str,
+    latency_ms: int,
+) -> None:
+    conn.execute(
+        """INSERT INTO query_log (timestamp, query, source_filter, top_k,
+                                  result_count, results_json, latency_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (_now(), query, source_filter, top_k, result_count, results_json, latency_ms),
+    )
+    conn.commit()
+
+
+def get_recent_queries(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    rows = conn.execute(
+        """SELECT id, timestamp, query, source_filter, top_k,
+                  result_count, results_json, latency_ms
+           FROM query_log ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "timestamp": r[1], "query": r[2],
+            "source_filter": r[3], "top_k": r[4], "result_count": r[5],
+            "results_json": r[6], "latency_ms": r[7],
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

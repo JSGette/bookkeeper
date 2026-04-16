@@ -48,6 +48,10 @@ def test_query_returns_results(mock_search_embed, mock_idx_embed, doc_tree, tmp_
     results = searcher.query("installation guide", top_k=5)
     assert len(results) > 0
     assert all("source" in r and "path" in r for r in results)
+    for r in results:
+        if r["source"] != "sessions":
+            assert "summary" in r
+            assert "matched_sections" in r
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
@@ -85,14 +89,14 @@ def test_deprecation_flag(mock_search_embed, mock_idx_embed, doc_tree, tmp_db):
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
-def test_score_gap_keeps_at_least_one(mock_search_embed, mock_idx_embed, doc_tree, tmp_db):
+def test_score_gap_keeps_min_results(mock_search_embed, mock_idx_embed, doc_tree, tmp_db):
     _build_test_index(doc_tree, tmp_db)
 
     searcher = Searcher(tmp_db)
     searcher.load()
 
-    results = searcher.query("completely unrelated xyzzy query gibberish", top_k=5)
-    assert len(results) >= 1
+    results = searcher.query("completely unrelated xyzzy query gibberish", top_k=5, min_results=2)
+    assert len(results) >= 2
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)

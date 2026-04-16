@@ -31,8 +31,8 @@ def _result_text(result: dict) -> str:
     """Extract the most relevant text from a result, regardless of type."""
     return (
         result.get("session_summary")
-        or result.get("text")
-        or result.get("text_preview", "")
+        or result.get("summary")
+        or result.get("text", "")
     )
 
 
@@ -51,7 +51,7 @@ def measure_rag_cost(searcher: Searcher, question: str, top_k: int = 5) -> dict:
         entry = {
             "source": r["source"],
             "path": r["path"],
-            "section": r.get("section", ""),
+            "section": ", ".join(r.get("matched_sections", [])) or r.get("section", ""),
             "score": r["score"],
             "tokens": tokens,
             "chars": len(text),
@@ -66,10 +66,8 @@ def measure_rag_cost(searcher: Searcher, question: str, top_k: int = 5) -> dict:
             entry["type"] = "merged"
             entry["merged_chunks"] = r["merged_chunks"]
         else:
-            entry["type"] = "chunk"
-
-        if r.get("doc_context"):
-            entry["has_doc_context"] = True
+            entry["type"] = "summary"
+            entry["has_summary"] = "summary" in r
 
         per_result.append(entry)
 
@@ -102,8 +100,8 @@ def print_cost_report(cost: dict) -> None:
             extra = f" [summary, {c['matched_turns']} turns matched]"
         elif c["type"] == "merged":
             extra = f" [merged {c['merged_chunks']} chunks]"
-        if c.get("has_doc_context"):
-            extra += " [+preamble]"
+        elif c["type"] == "summary" and c.get("has_summary"):
+            extra = " [doc summary]"
         print(f"{i:<3} {c['type']:<8} {c['source']:<10} {c['score']:<7.4f} {c['tokens']:<8} {c['path']}{section}{extra}")
 
     print(f"\nTotal context: {cost['total_tokens']} tokens ({cost['total_chars']} chars)")

@@ -21,7 +21,7 @@ from .db import (
     upsert_chunks,
     upsert_document,
 )
-from .tagger import load_overrides, tag_file
+from .tagger import load_overrides, tag_file, description_from_content
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,62 @@ def _get_model():
 def embed_texts(texts: list[str]) -> np.ndarray:
     model = _get_model()
     return model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+
+
+# ---------------------------------------------------------------------------
+# Document-level summarization
+# ---------------------------------------------------------------------------
+
+_DOC_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+    },
+    "required": ["summary"],
+}
+
+
+def summarize_document(content: str, title: str = "", use_gemma: bool = True) -> str:
+    """Produce a 2-3 sentence document summary. Falls back to first paragraph."""
+    if not use_gemma:
+        return description_from_content(content)
+
+    try:
+        import httpx
+        from .tagger import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_KEEP_ALIVE
+
+        excerpt = content[:30_000]
+        messages = [
+            {"role": "system", "content": (
+                "Summarize this document in 2-3 sentences. Focus on what the document "
+                "covers and its key conclusions or recommendations. Be specific — mention "
+                "exact tools, concepts, or decisions. Output JSON with a single 'summary' key."
+            )},
+            {"role": "user", "content": excerpt},
+        ]
+        resp = httpx.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": False,
+                "format": _DOC_SUMMARY_SCHEMA,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+                "options": {"temperature": 0.1, "num_predict": 512},
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        resp.raise_for_status()
+        import json as _json
+        raw = resp.json().get("message", {}).get("content", "")
+        data = _json.loads(raw)
+        summary = data.get("summary", "").strip()
+        if summary:
+            return summary
+    except Exception as exc:
+        log.warning("Document summarization failed, using fallback: %s", exc)
+
+    return description_from_content(content)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +196,7 @@ def _persist_chunks_to_db(
     chunks: list[Chunk],
     vectors: np.ndarray,
     metadata: list[dict],
+    use_gemma: bool = True,
 ) -> None:
     """Write chunks and their source documents into the DB."""
     root = Path(os.path.expanduser(source_cfg.path))
@@ -156,7 +213,10 @@ def _persist_chunks_to_db(
             content = ""
         title = items[0][0].get("doc_title", "")
         preamble = items[0][0].get("doc_preamble", "")
-        doc_id = upsert_document(conn, source_cfg.name, rel_path, title, preamble, content)
+        summary = summarize_document(content, title=title, use_gemma=use_gemma)
+        doc_id = upsert_document(
+            conn, source_cfg.name, rel_path, title, preamble, content, summary=summary,
+        )
 
         chunk_metas = [m for m, _ in items]
         chunk_vecs_idx = [idx for _, idx in items]
@@ -269,7 +329,7 @@ def reindex_source(
             vectors = np.vstack(parts) if parts else np.empty((0, 384))
             metadata = [_chunk_to_meta(c) for c in ordered_chunks]
 
-            _persist_chunks_to_db(conn, source_cfg, ordered_chunks, vectors, metadata)
+            _persist_chunks_to_db(conn, source_cfg, ordered_chunks, vectors, metadata, use_gemma=use_gemma)
             _update_state(conn, source_cfg, root, all_chunks, is_git)
             elapsed = time.monotonic() - t0
             log.info("Delta reindex %s: %d chunks in %.1fs", source_cfg.name, len(metadata), elapsed)
@@ -284,7 +344,7 @@ def reindex_source(
     vectors = embed_texts([c.embedding_text for c in all_chunks])
     metadata = [_chunk_to_meta(c) for c in all_chunks]
 
-    _persist_chunks_to_db(conn, source_cfg, all_chunks, vectors, metadata)
+    _persist_chunks_to_db(conn, source_cfg, all_chunks, vectors, metadata, use_gemma=use_gemma)
     _update_state(conn, source_cfg, root, all_chunks, is_git)
     elapsed = time.monotonic() - t0
     log.info("Full reindex %s: %d chunks in %.1fs", source_cfg.name, len(metadata), elapsed)

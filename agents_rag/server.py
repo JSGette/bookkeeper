@@ -67,38 +67,33 @@ _USAGE_GUIDE = """\
 # agents-rag Usage Guide
 
 Query results are prior notes and hypotheses, not ground truth — they may be outdated.
-Follow this protocol when consuming results:
+Results contain **summaries**, not raw text. Follow this protocol:
 
 1. Call `query_knowledge_base` with a short natural-language query describing the task.
-2. Use source to filter by source name, or omit to search all sources.
-3. Prefer recently indexed docs — check the `indexed_at` field; older docs are more likely stale.
-4. If a retrieved doc references source files, configs, or code paths, read those sources \
-too and add them to your working context — the doc is a pointer, the code is the truth.
-5. If a retrieved doc makes a factual claim about the codebase (e.g., "X blocks Y", \
-"module Z has a cycle"), verify it against the current source code before repeating it.
-6. If a result has "deprecated": true, do not use it as actionable context — treat it \
-purely as historical background. Mention it only if the user asks about past decisions \
-or evolution of the codebase. Never repeat its claims as current facts.
-7. If during verification (step 5) a doc's claims are contradicted by the current source \
-code, call `deprecate_doc` with the doc path and a brief reason explaining what changed. \
-This keeps the knowledge base accurate for future queries.
-8. At the end of a meaningful work session (implementation, investigation, debugging), \
-call `save_session` with a structured summary: title, what was done, key decisions, \
-files touched, and next steps. This lets the next chat resume without re-discovering context.
-9. Previous chat sessions are automatically indexed in the background. When starting new \
+2. Use `source` to filter by source name, or omit to search all sources.
+3. Prefer recently indexed docs — check `indexed_at`; older docs are more likely stale.
+4. **Document results** contain a `summary` field (a 2-3 sentence document-level overview) \
+and a `matched_sections` list showing which sections triggered the match. Use the summary \
+to decide relevance.
+5. **Session results** contain a `session_summary` field (distilled overview with decisions \
+and next steps). Multiple matching turns from the same session are collapsed into one \
+result; `matched_turns` shows which turns matched.
+6. If the summary is sufficient for your task, use it directly. If you need exact code, \
+specific details, or full context, call `get_full_document` with the `path` and `source` \
+fields from the result. Use `matched_sections` to know which part of the document to \
+focus on.
+7. If a result references source files, configs, or code paths, read those sources too — \
+the doc is a pointer, the code is the truth.
+8. If a result makes a factual claim about the codebase (e.g., "X blocks Y"), verify it \
+against the current source code before repeating it.
+9. If a result has `"deprecated": true`, do not use it as actionable context — treat it \
+purely as historical background.
+10. If during verification (step 8) a doc's claims are contradicted by the current source \
+code, call `deprecate_doc` with the doc path and a brief reason explaining what changed.
+11. At the end of a meaningful work session, call `save_session` with a structured summary: \
+title, what was done, key decisions, relevant files, and next steps.
+12. Previous chat sessions are automatically indexed in the background. When starting new \
 work, `query_knowledge_base` will surface prior session notes alongside documentation.
-10. **Session results** contain a `session_summary` field with the Gemma-distilled overview \
-(summary, decisions, next steps) instead of raw turn text. Multiple matching turns from the \
-same session are collapsed into one result; `matched_turns` shows which turns triggered the \
-match.
-11. To read the **full document** behind any result, call `get_full_document` with the \
-`path` and `source` fields from the result. This works for session transcripts, docs, or \
-any indexed content.
-12. Some non-session results include a `doc_context` field — a brief preamble from the \
-document's introduction. Use it to understand the chunk's position in the document before \
-deciding whether to call `get_full_document`.
-13. Some results include `text_preview` instead of full `text` when the chunk is large. \
-If the preview looks relevant, call `get_full_document` to retrieve the complete content.
 """
 
 
@@ -125,6 +120,10 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     sessions_output_dir = os.path.expanduser(sessions_config.get("output_dir", "~/.cache/agents-rag/sessions"))
     gemma_every_n = sessions_config.get("gemma_every_n_turns", 3)
     watch_interval = sessions_config.get("watch_interval_minutes", 5)
+
+    search_config = config.get("search", {})
+    score_threshold_z = float(search_config.get("score_threshold_z", 0.8))
+    min_results = int(search_config.get("min_results", 2))
 
     conn = db.init_db(db_path)
     searcher = Searcher(conn)
@@ -246,6 +245,10 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     def query_knowledge_base(query: str, max_results: int = 5, source: str | None = None) -> str:
         """Search the knowledge base for documentation relevant to a query.
 
+        Results contain document-level summaries, not raw text. Call
+        `get_full_document` with the result's `path` and `source` to read
+        the complete content when the summary isn't enough.
+
         Args:
             query: Natural language query describing what you're looking for.
             max_results: Number of results to return (default 5).
@@ -256,8 +259,20 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         if not searcher._metadata:
             return json.dumps({"error": "Index is empty. Run reindex first."})
 
-        results = searcher.query(query, top_k=max_results, source=source)
-        return json.dumps(results, indent=2)
+        t0 = time.monotonic()
+        results = searcher.query(
+            query, top_k=max_results, source=source,
+            score_threshold_z=score_threshold_z, min_results=min_results,
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        result_json = json.dumps(results, indent=2)
+        try:
+            db.log_query(conn, query, source, max_results, len(results), result_json, latency_ms)
+        except Exception:
+            log.warning("Failed to log query to audit table", exc_info=True)
+
+        return result_json
 
     _reindex_status: dict = {"running": False, "last_result": None}
 
@@ -507,6 +522,16 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         db.save_deprecated(conn, path, reason)
         searcher._deprecated = db.load_deprecated(conn)
         return json.dumps({"status": "deprecated", "path": path, "reason": reason})
+
+    @mcp.tool
+    def query_audit_log(limit: int = 20) -> str:
+        """Return recent knowledge base queries and their results for auditing.
+
+        Args:
+            limit: Maximum number of entries to return (default 20, most recent first).
+        """
+        entries = db.get_recent_queries(conn, limit=limit)
+        return json.dumps(entries, indent=2)
 
     return mcp
 

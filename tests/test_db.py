@@ -8,12 +8,15 @@ from agents_rag.db import (
     chunk_count,
     get_document_content,
     get_document_id,
+    get_document_summary,
+    get_recent_queries,
     init_db,
     load_all_chunks,
     load_deprecated,
     load_hnsw_cache,
     load_source_state,
     load_transcript_state,
+    log_query,
     remove_deprecated,
     save_deprecated,
     save_hnsw_cache,
@@ -37,6 +40,7 @@ def test_init_db_creates_tables(tmp_path):
     assert "deprecated" in tables
     assert "transcript_state" in tables
     assert "hnsw_cache" in tables
+    assert "query_log" in tables
     conn.close()
 
 
@@ -156,3 +160,38 @@ def test_transcript_state_roundtrip(tmp_db):
     loaded = load_transcript_state(tmp_db, path)
     assert loaded["turns_processed"] == 5
     assert loaded["byte_offset"] == 1234
+
+
+def test_document_summary_roundtrip(tmp_db):
+    upsert_document(tmp_db, "src", "a.md", "Title", "", "Full content", summary="A short summary")
+    assert get_document_summary(tmp_db, "src", "a.md") == "A short summary"
+    assert get_document_content(tmp_db, "src", "a.md") == "Full content"
+
+
+def test_document_summary_default_empty(tmp_db):
+    upsert_document(tmp_db, "src", "b.md", "Title", "", "Content")
+    assert get_document_summary(tmp_db, "src", "b.md") == ""
+
+
+def test_load_all_chunks_includes_doc_summary(tmp_db):
+    doc_id = upsert_document(tmp_db, "src", "a.md", "", "", "content", summary="doc sum")
+    vecs = np.random.randn(1, 384).astype(np.float32)
+    upsert_chunks(tmp_db, doc_id, [{"text": "chunk 1"}], vecs)
+
+    meta, _ = load_all_chunks(tmp_db)
+    assert meta[0]["doc_summary"] == "doc sum"
+
+
+def test_query_log_roundtrip(tmp_db):
+    assert get_recent_queries(tmp_db) == []
+
+    log_query(tmp_db, "test query", None, 5, 2, '["r1","r2"]', 42)
+    log_query(tmp_db, "second query", "docs", 3, 1, '["r3"]', 10)
+
+    entries = get_recent_queries(tmp_db, limit=10)
+    assert len(entries) == 2
+    assert entries[0]["query"] == "second query"
+    assert entries[0]["source_filter"] == "docs"
+    assert entries[0]["latency_ms"] == 10
+    assert entries[1]["query"] == "test query"
+    assert entries[1]["result_count"] == 2
