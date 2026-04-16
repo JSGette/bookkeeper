@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 
+from . import db
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
@@ -29,17 +31,15 @@ def _load_config() -> dict:
     return {}
 
 
-def _read_json(path: Path) -> list | dict | None:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
 class Handler(SimpleHTTPRequestHandler):
-    cache_dir: str = ""
+    db_path: str = ""
+    _conn = None
+
+    @classmethod
+    def get_conn(cls):
+        if cls._conn is None:
+            cls._conn = db.init_db(cls.db_path)
+        return cls._conn
 
     def do_GET(self):  # noqa: N802
         if self.path == "/" or self.path == "/index.html":
@@ -73,20 +73,22 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_chunks(self) -> None:
-        meta = _read_json(Path(self.cache_dir) / "chunks.json")
-        if meta is None:
+        conn = self.get_conn()
+        meta, _ = db.load_all_chunks(conn)
+        if not meta:
             self._json_response({"error": "No index found. Run reindex first."}, 404)
             return
-        texts = _read_json(Path(self.cache_dir) / "texts.json") or []
-        for i, m in enumerate(meta):
-            text = texts[i] if i < len(texts) else m.pop("text", "")
+        for m in meta:
+            text = m.get("text", "")
             m["preview"] = text[:200] if text else ""
+            m.pop("text", None)
         self._json_response(meta)
 
     def _serve_stats(self) -> None:
-        meta = _read_json(Path(self.cache_dir) / "chunks.json")
-        deprecated = _read_json(Path(self.cache_dir) / "deprecated.json") or {}
-        if meta is None:
+        conn = self.get_conn()
+        meta, _ = db.load_all_chunks(conn)
+        deprecated = db.load_deprecated(conn)
+        if not meta:
             self._json_response({"total": 0, "sources": {}, "tags": {}, "deprecated": 0})
             return
         source_counts: Counter[str] = Counter()
@@ -113,10 +115,10 @@ def main() -> None:
 
     config = _load_config()
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
-    Handler.cache_dir = cache_dir
+    Handler.db_path = os.path.join(cache_dir, "agents-rag.db")
 
     server = HTTPServer(("127.0.0.1", args.port), Handler)
-    log.info("Serving on http://127.0.0.1:%d  (cache_dir=%s)", args.port, cache_dir)
+    log.info("Serving on http://127.0.0.1:%d  (db=%s)", args.port, Handler.db_path)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

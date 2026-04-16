@@ -11,13 +11,13 @@ dependencies = [
     "httpx>=0.27",
     "tiktoken>=0.7",
     "rank-bm25>=0.2",
+    "hnswlib>=0.8",
 ]
 
 [project.optional-dependencies]
 code = ["treesitter-chunker>=0.4"]
-perf = ["hnswlib>=0.8"]
 test = ["pytest>=8.0"]
-all = ["treesitter-chunker>=0.4", "hnswlib>=0.8"]
+all = ["treesitter-chunker>=0.4"]
 
 [project.scripts]
 agents-rag = "agents_rag.server:main"

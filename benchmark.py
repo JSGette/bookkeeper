@@ -10,6 +10,7 @@ import sys
 
 import tiktoken
 
+from agents_rag.db import init_db
 from agents_rag.searcher import Searcher
 
 QUESTION = "What are the known blockers and risks for migrating system-probe to Bazel?"
@@ -142,8 +143,10 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("AGENTS_RAG_CACHE", "~/.cache/agents-rag")
     )
+    db_path = os.path.join(cache_dir, "agents-rag.db")
+    conn = init_db(db_path)
 
-    searcher = Searcher(cache_dir)
+    searcher = Searcher(conn)
     if not searcher.load():
         print("ERROR: No index found. Run reindex first.", file=sys.stderr)
         sys.exit(1)

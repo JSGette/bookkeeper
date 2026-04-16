@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from agents_rag.db import init_db
+
 
 @pytest.fixture
 def tmp_cache(tmp_path: Path) -> str:
@@ -15,6 +17,15 @@ def tmp_cache(tmp_path: Path) -> str:
     d = tmp_path / "cache"
     d.mkdir()
     return str(d)
+
+
+@pytest.fixture
+def tmp_db(tmp_path: Path):
+    """Initialized in-memory-like SQLite connection for tests."""
+    db_path = str(tmp_path / "test.db")
+    conn = init_db(db_path)
+    yield conn
+    conn.close()
 
 
 @pytest.fixture

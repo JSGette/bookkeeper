@@ -1,19 +1,16 @@
-"""Tests for indexer: mtime delta detection, load/save roundtrip, integrity check."""
+"""Tests for indexer: mtime delta detection, DB roundtrip, reindex."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
+from agents_rag.db import load_all_chunks, upsert_chunks, upsert_document
 from agents_rag.indexer import (
     _mtime_changed_files,
-    embed_texts,
-    load_index,
     reindex_source,
-    save_index,
 )
 from tests.conftest import make_source_cfg
 
@@ -62,27 +59,24 @@ def test_mtime_mixed():
 
 
 # ---------------------------------------------------------------------------
-# save_index / load_index roundtrip
+# DB save / load roundtrip
 # ---------------------------------------------------------------------------
 
-def test_save_load_roundtrip(tmp_cache: str):
+def test_save_load_roundtrip(tmp_db):
     vecs = np.random.randn(3, 384).astype(np.float32)
     meta = [
-        {"source": "test", "path": "a.md", "text": "hello"},
-        {"source": "test", "path": "b.md", "text": "world"},
-        {"source": "test", "path": "c.md", "text": "foo"},
+        {"source": "test", "path": "a.md", "text": "hello", "section_heading": ""},
+        {"source": "test", "path": "a.md", "text": "world", "section_heading": "sec2"},
+        {"source": "test", "path": "b.md", "text": "foo", "section_heading": ""},
     ]
-    save_index(tmp_cache, vecs, meta)
 
-    # texts.json should exist separately from chunks.json
-    idx_dir = Path(tmp_cache)
-    assert (idx_dir / "texts.json").exists()
-    stored_meta = json.loads((idx_dir / "chunks.json").read_text())
-    assert "text" not in stored_meta[0], "chunks.json should not contain text"
+    doc_id_a = upsert_document(tmp_db, "test", "a.md", "", "", "hello\nworld")
+    upsert_chunks(tmp_db, doc_id_a, meta[:2], vecs[:2])
 
-    loaded_vecs, loaded_meta = load_index(tmp_cache)
-    assert loaded_vecs is not None
-    assert loaded_meta is not None
+    doc_id_b = upsert_document(tmp_db, "test", "b.md", "", "", "foo")
+    upsert_chunks(tmp_db, doc_id_b, meta[2:], vecs[2:])
+
+    loaded_meta, loaded_vecs = load_all_chunks(tmp_db)
     assert loaded_vecs.shape == vecs.shape
     assert np.allclose(loaded_vecs, vecs, atol=1e-5)
     assert len(loaded_meta) == 3
@@ -90,45 +84,10 @@ def test_save_load_roundtrip(tmp_cache: str):
     assert loaded_meta[0]["text"] == "hello"
 
 
-def test_load_index_without_texts(tmp_cache: str):
-    """include_texts=False returns metadata without text field."""
-    vecs = np.random.randn(2, 384).astype(np.float32)
-    meta = [
-        {"source": "test", "path": "a.md", "text": "hello"},
-        {"source": "test", "path": "b.md", "text": "world"},
-    ]
-    save_index(tmp_cache, vecs, meta)
-    _, loaded_meta = load_index(tmp_cache, include_texts=False)
-    assert loaded_meta is not None
-    assert "text" not in loaded_meta[0]
-
-
-def test_load_missing_index(tmp_cache: str):
-    vecs, meta = load_index(tmp_cache)
-    assert vecs is None
-    assert meta is None
-
-
-# ---------------------------------------------------------------------------
-# Integrity check: mismatched vector/metadata lengths
-# ---------------------------------------------------------------------------
-
-def test_load_index_corrupted(tmp_cache: str):
-    """Mismatched vector and metadata counts should return (None, None)."""
-    vecs = np.random.randn(3, 384).astype(np.float32)
-    meta = [
-        {"source": "test", "path": "a.md"},
-        {"source": "test", "path": "b.md"},
-    ]
-    texts = ["hello", "world"]
-    idx_dir = Path(tmp_cache)
-    np.savez_compressed(idx_dir / "index.npz", vectors=vecs)
-    (idx_dir / "chunks.json").write_text(json.dumps(meta))
-    (idx_dir / "texts.json").write_text(json.dumps(texts))
-
-    loaded_vecs, loaded_meta = load_index(tmp_cache)
-    assert loaded_vecs is None
-    assert loaded_meta is None
+def test_load_empty_db(tmp_db):
+    meta, vecs = load_all_chunks(tmp_db)
+    assert len(meta) == 0
+    assert vecs.shape == (0, 384)
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +95,9 @@ def test_load_index_corrupted(tmp_cache: str):
 # ---------------------------------------------------------------------------
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
-def test_reindex_source_full(mock_embed, doc_tree: Path, tmp_cache: str):
-    """Full reindex of a non-git directory produces metadata and vectors."""
+def test_reindex_source_full(mock_embed, doc_tree: Path, tmp_db):
     cfg = make_source_cfg(doc_tree, file_types=[".md"])
-    meta, vecs, changed = reindex_source(cfg, tmp_cache, use_gemma=False)
+    meta, vecs, changed = reindex_source(cfg, tmp_db, use_gemma=False)
 
     assert changed is True
     assert len(meta) > 0
@@ -151,32 +109,27 @@ def test_reindex_source_full(mock_embed, doc_tree: Path, tmp_cache: str):
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
-def test_reindex_source_no_changes(mock_embed, doc_tree: Path, tmp_cache: str):
-    """Second reindex with no file changes returns index_changed=False."""
+def test_reindex_source_no_changes(mock_embed, doc_tree: Path, tmp_db):
     cfg = make_source_cfg(doc_tree, file_types=[".md"])
 
-    meta1, vecs1, changed1 = reindex_source(cfg, tmp_cache, use_gemma=False)
+    meta1, vecs1, changed1 = reindex_source(cfg, tmp_db, use_gemma=False)
     assert changed1 is True
-    save_index(tmp_cache, vecs1, meta1)
 
-    meta2, vecs2, changed2 = reindex_source(cfg, tmp_cache, use_gemma=False)
+    meta2, vecs2, changed2 = reindex_source(cfg, tmp_db, use_gemma=False)
     assert changed2 is False
     assert len(meta2) == len(meta1)
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
-def test_reindex_source_delta(mock_embed, doc_tree: Path, tmp_cache: str):
-    """Modifying a file triggers delta reindex with embedding reuse."""
+def test_reindex_source_delta(mock_embed, doc_tree: Path, tmp_db):
     cfg = make_source_cfg(doc_tree, file_types=[".md"])
 
-    meta1, vecs1, _ = reindex_source(cfg, tmp_cache, use_gemma=False)
-    save_index(tmp_cache, vecs1, meta1)
+    meta1, vecs1, _ = reindex_source(cfg, tmp_db, use_gemma=False)
     original_count = len(meta1)
 
-    # Modify one file
     (doc_tree / "faq.md").write_text("# FAQ\n\n## New Question\n\nNew answer here.\n")
 
-    meta2, vecs2, changed2 = reindex_source(cfg, tmp_cache, use_gemma=False)
+    meta2, vecs2, changed2 = reindex_source(cfg, tmp_db, use_gemma=False)
     assert changed2 is True
     assert vecs2.shape[0] == len(meta2)
     assert abs(len(meta2) - original_count) <= 2

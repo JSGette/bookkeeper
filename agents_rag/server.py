@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -15,10 +16,11 @@ import numpy as np
 import yaml
 from fastmcp import FastMCP
 
+from . import db
 from .chunker import SourceConfig
 from .index_generator import update_index_file
-from .indexer import embed_texts, load_index, reindex_all, save_index
-from .searcher import Searcher, load_deprecated, save_deprecated
+from .indexer import embed_texts, reindex_all
+from .searcher import Searcher
 from .tagger import configure as configure_tagger
 from .transcript import TranscriptWatcher, distill_all_transcripts
 
@@ -88,14 +90,15 @@ work, `query_knowledge_base` will surface prior session notes alongside document
 10. **Session results** contain a `session_summary` field with the Gemma-distilled overview \
 (summary, decisions, next steps) instead of raw turn text. Multiple matching turns from the \
 same session are collapsed into one result; `matched_turns` shows which turns triggered the \
-match. If the summary is relevant and you need full context, call `get_full_session` with \
-the `full_session_path` from the result.
-11. Some non-session results include a `doc_context` field — a brief preamble from the \
+match.
+11. To read the **full document** behind any result, call `get_full_document` with the \
+`path` and `source` fields from the result. This works for session transcripts, docs, or \
+any indexed content.
+12. Some non-session results include a `doc_context` field — a brief preamble from the \
 document's introduction. Use it to understand the chunk's position in the document before \
-deciding whether to read the full file.
-12. Some results include `text_preview` instead of full `text` when the chunk is large. \
-If the preview looks relevant, use the `path`, `start_line`, and `end_line` fields to \
-read the original file directly (e.g., via the Read tool).
+deciding whether to call `get_full_document`.
+13. Some results include `text_preview` instead of full `text` when the chunk is large. \
+If the preview looks relevant, call `get_full_document` to retrieve the complete content.
 """
 
 
@@ -113,6 +116,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     config = config_override if config_override is not None else _load_config()
     sources = _parse_sources(config)
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
+    db_path = os.path.join(cache_dir, "agents-rag.db")
     use_gemma = config.get("use_gemma", True)
     configure_tagger(config)
 
@@ -122,15 +126,15 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     gemma_every_n = sessions_config.get("gemma_every_n_turns", 3)
     watch_interval = sessions_config.get("watch_interval_minutes", 5)
 
-    source_roots = {src.name: src.path for src in sources}
-    searcher = Searcher(cache_dir, source_roots=source_roots)
+    conn = db.init_db(db_path)
+    searcher = Searcher(conn)
     index_lock = threading.Lock()
 
     # Index queue — serialises all embed-merge-save-reload work on a single thread
     index_q: queue.Queue[list[dict] | None] = queue.Queue()
 
     def _index_worker() -> None:
-        """Drain the queue in batches: embed new chunks, merge, save, reload."""
+        """Drain the queue in batches: embed new chunks, merge into DB, reload searcher."""
         while True:
             batch = index_q.get()
             if batch is None:
@@ -144,28 +148,66 @@ def create_app(config_override: dict | None = None) -> FastMCP:
                     break
             try:
                 with index_lock:
-                    existing_vecs, existing_meta = load_index(cache_dir)
-                    if existing_meta:
-                        existing_keys = {
-                            (m["source"], m["path"], m.get("section_heading", ""))
-                            for m in existing_meta
-                        }
-                        batch = [
-                            c for c in batch
-                            if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
-                        ]
+                    # Deduplicate against existing chunks
+                    existing_meta, _ = db.load_all_chunks(conn)
+                    existing_keys = {
+                        (m["source"], m["path"], m.get("section_heading", ""))
+                        for m in existing_meta
+                    } if existing_meta else set()
+
+                    batch = [
+                        c for c in batch
+                        if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
+                    ]
                     if not batch:
                         log.info("Index queue: all chunks already present, skipping")
                         continue
+
                     texts = [c["text"] for c in batch]
                     new_vecs = embed_texts(texts)
-                    if existing_vecs is not None and existing_meta is not None:
-                        merged_vecs = np.vstack([existing_vecs, new_vecs])
-                        merged_meta = existing_meta + batch
-                    else:
-                        merged_vecs = new_vecs
-                        merged_meta = batch
-                    save_index(cache_dir, merged_vecs, merged_meta)
+
+                    # Group by (source, path) and upsert
+                    by_doc: dict[tuple[str, str], list[tuple[dict, int]]] = {}
+                    for i, c in enumerate(batch):
+                        key = (c["source"], c["path"])
+                        by_doc.setdefault(key, []).append((c, i))
+
+                    for (src, path), items in by_doc.items():
+                        doc_id = db.get_document_id(conn, src, path)
+                        if doc_id is None:
+                            content = items[0][0].get("text", "")
+                            title = items[0][0].get("doc_title", "")
+                            doc_id = db.upsert_document(conn, src, path, title, "", content)
+                        chunk_metas = [c for c, _ in items]
+                        chunk_indices = [idx for _, idx in items]
+                        chunk_vecs = new_vecs[chunk_indices]
+                        # Append to existing chunks (don't delete old ones)
+                        for j, cm in enumerate(chunk_metas):
+                            vec_blob = chunk_vecs[j].astype(np.float32).tobytes()
+                            conn.execute(
+                                """INSERT INTO chunks
+                                   (doc_id, section_heading, start_line, end_line, text, tags,
+                                    description, doc_preamble, indexed_at, vector,
+                                    session_summary, full_session_path, session_turn_count)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    doc_id,
+                                    cm.get("section_heading", ""),
+                                    cm.get("start_line", 0),
+                                    cm.get("end_line", 0),
+                                    cm.get("text", ""),
+                                    json.dumps(cm.get("tags", [])),
+                                    cm.get("description", ""),
+                                    cm.get("doc_preamble", ""),
+                                    cm.get("indexed_at", ""),
+                                    vec_blob,
+                                    cm.get("session_summary"),
+                                    cm.get("full_session_path"),
+                                    cm.get("session_turn_count"),
+                                ),
+                            )
+                        conn.commit()
+
                     searcher.reload()
                 log.info("Index queue: flushed %d chunks", len(batch))
             except Exception:
@@ -175,16 +217,14 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     index_thread.start()
 
     def _flush_transcript_chunks(chunks: list[dict]) -> None:
-        """Enqueue transcript chunks for async embedding and index merge."""
         index_q.put(chunks)
 
     mcp = FastMCP(name="agents-rag")
 
-    # Start background watcher if configured
     if transcript_dirs and watch_interval > 0:
         watcher = TranscriptWatcher(
             transcript_dirs=transcript_dirs,
-            cache_dir=cache_dir,
+            conn=conn,
             output_dir=sessions_output_dir,
             interval_minutes=watch_interval,
             gemma_every_n=gemma_every_n,
@@ -203,12 +243,12 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         return _USAGE_GUIDE
 
     @mcp.tool
-    def query_knowledge_base(query: str, top_k: int = 5, source: str | None = None) -> str:
+    def query_knowledge_base(query: str, max_results: int = 5, source: str | None = None) -> str:
         """Search the knowledge base for documentation relevant to a query.
 
         Args:
             query: Natural language query describing what you're looking for.
-            top_k: Number of results to return (default 5).
+            max_results: Number of results to return (default 5).
             source: Filter by source name (as defined in config.yaml), or omit for both.
         """
         if not searcher._metadata:
@@ -216,18 +256,17 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         if not searcher._metadata:
             return json.dumps({"error": "Index is empty. Run reindex first."})
 
-        results = searcher.query(query, top_k=top_k, source=source)
+        results = searcher.query(query, top_k=max_results, source=source)
         return json.dumps(results, indent=2)
 
     _reindex_status: dict = {"running": False, "last_result": None}
 
     def _reindex_worker(source_filter: str | None) -> None:
-        """Background worker for reindex."""
         t0 = time.monotonic()
         try:
             with index_lock:
                 meta, vecs, count = reindex_all(
-                    sources, cache_dir, use_gemma=use_gemma, source_filter=source_filter,
+                    sources, conn, use_gemma=use_gemma, source_filter=source_filter,
                 )
                 searcher.reload()
 
@@ -280,7 +319,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         """
         t0 = time.monotonic()
         total = distill_all_transcripts(
-            transcript_dirs, cache_dir, sessions_output_dir,
+            transcript_dirs, conn, sessions_output_dir,
             gemma_every_n=gemma_every_n, use_gemma=use_gemma,
             flush_fn=_flush_transcript_chunks,
         )
@@ -324,27 +363,13 @@ def create_app(config_override: dict | None = None) -> FastMCP:
 
         return json.dumps(result, indent=2)
 
-    @mcp.tool
-    def save_session(
+    def _save_session_sync(
         title: str,
         summary: str,
-        relevant_files: list[str] | None = None,
-        decisions: list[str] | None = None,
-        next_steps: list[str] | None = None,
+        relevant_files: list[str] | None,
+        decisions: list[str] | None,
+        next_steps: list[str] | None,
     ) -> str:
-        """Persist a structured summary of the current work session for future retrieval.
-
-        Call this at the end of a meaningful work session (implementation, investigation,
-        debugging) so the next chat can resume without re-discovering context.
-
-        Args:
-            title: Short name for the task (e.g. "Add BM25 hybrid search").
-            summary: 1-2 sentence description of what was accomplished.
-            relevant_files: List of files central to the work.
-            decisions: Key technical decisions made and their rationale.
-            next_steps: What remains to be done.
-        """
-        t0 = time.monotonic()
         output_dir = sessions_output_dir
         os.makedirs(output_dir, exist_ok=True)
 
@@ -382,7 +407,8 @@ def create_app(config_override: dict | None = None) -> FastMCP:
                 parts.append(f"- {s}")
             parts.append("")
 
-        Path(filepath).write_text("\n".join(parts))
+        content = "\n".join(parts)
+        Path(filepath).write_text(content)
 
         index_q.put([{
             "source": "sessions",
@@ -393,7 +419,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             "end_line": 0,
             "tags": [],
             "description": summary[:200],
-            "text": "\n".join(parts),
+            "text": content,
             "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }])
 
@@ -403,22 +429,61 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         })
 
     @mcp.tool
-    def get_full_session(path: str) -> str:
-        """Read the full session transcript summary. Use when a session result
-        from query_knowledge_base needs deeper context.
+    async def save_session(
+        title: str,
+        summary: str,
+        relevant_files: list[str] | None = None,
+        decisions: list[str] | None = None,
+        next_steps: list[str] | None = None,
+    ) -> str:
+        """Persist a structured summary of the current work session for future retrieval.
+
+        Call this at the end of a meaningful work session (implementation, investigation,
+        debugging) so the next chat can resume without re-discovering context.
 
         Args:
-            path: The full_session_path from a session query result.
+            title: Short name for the task (e.g. "Add BM25 hybrid search").
+            summary: 1-2 sentence description of what was accomplished.
+            relevant_files: List of files central to the work.
+            decisions: Key technical decisions made and their rationale.
+            next_steps: What remains to be done.
         """
+        return await asyncio.to_thread(
+            _save_session_sync, title, summary, relevant_files, decisions, next_steps
+        )
+
+    @mcp.tool
+    def get_full_document(path: str, source: str | None = None) -> str:
+        """Read the full content of a document from the knowledge base. Use when a
+        query result chunk is relevant and you need the complete document.
+
+        Args:
+            path: The path field from a query result.
+            source: The source field from the query result. If omitted, searches all sources.
+        """
+        # Try DB — search specific source or all sources
+        if source:
+            content = db.get_document_content(conn, source, path)
+            if content:
+                return content
+        else:
+            row = conn.execute(
+                "SELECT content FROM documents WHERE path=? LIMIT 1", (path,),
+            ).fetchone()
+            if row:
+                return row[0]
+
+        # Fall back to filesystem for session files
         p = Path(path)
         if not p.is_absolute():
             p = Path(sessions_output_dir) / path
-        if not p.exists():
-            return json.dumps({"error": f"Session file not found: {p}"})
-        try:
-            return p.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return json.dumps({"error": str(exc)})
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+
+        return json.dumps({"error": f"Document not found: {path}"})
 
     @mcp.tool
     def deprecate_doc(path: str, reason: str = "", undeprecate: bool = False) -> str:
@@ -429,21 +494,18 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             reason: Why the doc is outdated (e.g. "dependency cycles were resolved in PR #1234").
             undeprecate: Set to true to remove the deprecation flag and restore the doc to normal status.
         """
-        deprecated = load_deprecated(cache_dir)
         if undeprecate:
-            removed = deprecated.pop(path, None)
-            save_deprecated(cache_dir, deprecated)
-            searcher._deprecated = deprecated
-            if removed is not None:
+            removed = db.remove_deprecated(conn, path)
+            searcher._deprecated = db.load_deprecated(conn)
+            if removed:
                 return json.dumps({"status": "restored", "path": path})
             return json.dumps({"status": "not_found", "path": path, "message": "Doc was not deprecated."})
 
         if not reason:
             return json.dumps({"error": "A reason is required when deprecating a doc."})
 
-        deprecated[path] = reason
-        save_deprecated(cache_dir, deprecated)
-        searcher._deprecated = deprecated
+        db.save_deprecated(conn, path, reason)
+        searcher._deprecated = db.load_deprecated(conn)
         return json.dumps({"status": "deprecated", "path": path, "reason": reason})
 
     return mcp

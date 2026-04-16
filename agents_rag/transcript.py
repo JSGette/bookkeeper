@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from .tagger import (
     _clean_tags,
     tags_from_path,
 )
+from . import db as db_mod
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +69,6 @@ def parse_turns(text: str, start_offset: int = 0) -> list[Turn]:
             running_offset += len(block) + len("user:\n")
             continue
 
-        # Extract assistant text (non-tool-call lines from assistant: blocks)
         assistant_parts = []
         for a_block in re.split(r"^assistant:\s*$", block, flags=re.MULTILINE)[1:]:
             lines = a_block.splitlines()
@@ -86,7 +87,6 @@ def parse_turns(text: str, start_offset: int = 0) -> list[Turn]:
         for m in _TOOL_ANY_RE.finditer(block):
             tools_called.append(m.group(1))
 
-        # Extract file paths from tool calls
         tool_sections = list(re.finditer(r"^\[Tool call\]\s+(\S+)", block, re.MULTILINE))
         for j, tm in enumerate(tool_sections):
             tool_name = tm.group(1)
@@ -112,35 +112,6 @@ def parse_turns(text: str, start_offset: int = 0) -> list[Turn]:
         running_offset += len(block) + len("user:\n")
 
     return turns
-
-
-# ---------------------------------------------------------------------------
-# State tracking per transcript
-# ---------------------------------------------------------------------------
-
-def _state_dir(cache_dir: str) -> Path:
-    return Path(cache_dir) / "transcripts"
-
-
-def _state_path(cache_dir: str, transcript_path: str) -> Path:
-    h = hashlib.sha256(transcript_path.encode()).hexdigest()[:16]
-    return _state_dir(cache_dir) / f"{h}.state.json"
-
-
-def load_transcript_state(cache_dir: str, transcript_path: str) -> dict:
-    p = _state_path(cache_dir, transcript_path)
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def save_transcript_state(cache_dir: str, transcript_path: str, state: dict) -> None:
-    p = _state_path(cache_dir, transcript_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +152,6 @@ def write_summary_file(
     gemma_summary: dict | None = None,
     append: bool = False,
 ) -> None:
-    """Write or append to the summary markdown file."""
     p = Path(summary_path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -237,7 +207,6 @@ _DISTILL_SCHEMA = {
 
 
 def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
-    """Call Gemma to produce a structured summary of the conversation."""
     skeleton = "\n".join(
         f"Turn {t.index + 1}: {t.user_query}\n"
         f"  Files: {', '.join(t.files_read[:5] + t.files_edited[:5])}\n"
@@ -293,11 +262,9 @@ def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
 # ---------------------------------------------------------------------------
 
 def tag_turn(turn: Turn, transcript_tags: list[str]) -> list[str]:
-    """Produce tags for a single turn: transcript-level + turn-level heuristic."""
     turn_tags: list[str] = []
     for f in turn.files_read + turn.files_edited:
         turn_tags.extend(tags_from_path(f))
-    # Extract keywords from query (simple: tokens > 3 chars, not stopwords)
     stopwords = {"what", "does", "this", "that", "with", "from", "should", "also", "have", "been",
                  "make", "will", "about", "into", "like", "well", "could", "would"}
     for word in re.findall(r"[a-z][a-z0-9_-]+", turn.user_query.lower()):
@@ -316,7 +283,6 @@ def tag_turn(turn: Turn, transcript_tags: list[str]) -> list[str]:
 
 
 def _format_session_summary(gemma_summary: dict) -> str:
-    """Format a Gemma summary dict as compact markdown for chunk metadata."""
     parts: list[str] = []
     if gemma_summary.get("summary"):
         parts.append(gemma_summary["summary"])
@@ -337,7 +303,7 @@ def _format_session_summary(gemma_summary: dict) -> str:
 
 def distill_transcript(
     transcript_path: str,
-    cache_dir: str,
+    conn: sqlite3.Connection,
     output_dir: str,
     gemma_every_n: int = 3,
     use_gemma: bool = True,
@@ -347,7 +313,7 @@ def distill_transcript(
     if not p.exists():
         return []
 
-    state = load_transcript_state(cache_dir, transcript_path)
+    state = db_mod.load_transcript_state(conn, transcript_path)
     turns_processed = state.get("turns_processed", 0)
     byte_offset = state.get("byte_offset", 0)
     summary_path = state.get("summary_path", "")
@@ -358,7 +324,6 @@ def distill_transcript(
     except OSError:
         return []
 
-    # Parse only new content
     if byte_offset > 0 and byte_offset < len(content):
         new_content = content[byte_offset:]
     elif byte_offset == 0:
@@ -368,20 +333,17 @@ def distill_transcript(
 
     new_turns = parse_turns(new_content, byte_offset)
     if not new_turns:
-        # Advance offset so we don't re-read the same trailing bytes
-        save_transcript_state(cache_dir, transcript_path, {
+        db_mod.save_transcript_state(conn, transcript_path, {
             **state,
             "byte_offset": len(content),
         })
         return []
 
-    # Re-number turns to continue from where we left off
     for t in new_turns:
         t.index = turns_processed + new_turns.index(t)
 
     transcript_id = p.stem
 
-    # Determine title from first turn ever
     if turns_processed == 0 and new_turns:
         title = new_turns[0].user_query
         if not summary_path:
@@ -389,14 +351,12 @@ def distill_transcript(
     else:
         title = state.get("title", "Untitled Session")
 
-    # Gemma summarization (batched — only when enough new turns accumulated)
     total_turns = turns_processed + len(new_turns)
     gemma_summary = None
     transcript_tags: list[str] = state.get("transcript_tags", [])
     session_summary_text: str = state.get("gemma_summary_text", "")
 
     if use_gemma and (total_turns - gemma_summary_turn) >= gemma_every_n:
-        # Parse all turns for full context
         all_turns = parse_turns(content)
         for i, t in enumerate(all_turns):
             t.index = i
@@ -406,19 +366,16 @@ def distill_transcript(
             gemma_summary_turn = total_turns
             session_summary_text = _format_session_summary(gemma_summary)
 
-    # Write summary file
     if turns_processed == 0:
         write_summary_file(summary_path, transcript_id, title, new_turns, gemma_summary)
     else:
         write_summary_file(summary_path, transcript_id, title, new_turns, append=True)
-        # If gemma ran, rewrite the full file to update the header
         if gemma_summary:
             all_turns = parse_turns(content)
             for i, t in enumerate(all_turns):
                 t.index = i
             write_summary_file(summary_path, transcript_id, title, all_turns, gemma_summary)
 
-    # Build chunk metadata for new turns
     new_chunks = []
     for turn in new_turns:
         turn_tags = tag_turn(turn, transcript_tags)
@@ -440,9 +397,8 @@ def distill_transcript(
             chunk["session_summary"] = session_summary_text
         new_chunks.append(chunk)
 
-    # Update state
     new_byte_offset = byte_offset + len(new_content)
-    save_transcript_state(cache_dir, transcript_path, {
+    db_mod.save_transcript_state(conn, transcript_path, {
         "turns_processed": total_turns,
         "byte_offset": new_byte_offset,
         "summary_path": summary_path,
@@ -457,7 +413,7 @@ def distill_transcript(
 
 def distill_all_transcripts(
     transcript_dirs: list[str],
-    cache_dir: str,
+    conn: sqlite3.Connection,
     output_dir: str,
     gemma_every_n: int = 3,
     use_gemma: bool = True,
@@ -478,19 +434,18 @@ def distill_all_transcripts(
         if not td_path.is_dir():
             continue
         for txt_file in sorted(td_path.glob("*.txt")):
-            state = load_transcript_state(cache_dir, str(txt_file))
+            state = db_mod.load_transcript_state(conn, str(txt_file))
             try:
                 stat = txt_file.stat()
                 mtime = stat.st_mtime
                 fsize = stat.st_size
             except OSError:
                 continue
-            # Skip if mtime unchanged AND file hasn't grown past our offset
             if state.get("last_mtime") == mtime and fsize <= state.get("byte_offset", 0):
                 continue
 
             new_chunks = distill_transcript(
-                str(txt_file), cache_dir, output,
+                str(txt_file), conn, output,
                 gemma_every_n=gemma_every_n, use_gemma=use_gemma,
             )
 
@@ -498,9 +453,9 @@ def distill_all_transcripts(
                 flush_fn(new_chunks)
             total_new += len(new_chunks)
 
-            st = load_transcript_state(cache_dir, str(txt_file))
+            st = db_mod.load_transcript_state(conn, str(txt_file))
             st["last_mtime"] = mtime
-            save_transcript_state(cache_dir, str(txt_file), st)
+            db_mod.save_transcript_state(conn, str(txt_file), st)
 
     return total_new
 
@@ -515,7 +470,7 @@ class TranscriptWatcher:
     def __init__(
         self,
         transcript_dirs: list[str],
-        cache_dir: str,
+        conn: sqlite3.Connection,
         output_dir: str,
         interval_minutes: float,
         gemma_every_n: int,
@@ -523,7 +478,7 @@ class TranscriptWatcher:
         flush_fn: Callable[[list[dict]], None],
     ):
         self.transcript_dirs = transcript_dirs
-        self.cache_dir = cache_dir
+        self.conn = conn
         self.output_dir = output_dir
         self.interval = interval_minutes * 60
         self.gemma_every_n = gemma_every_n
@@ -550,7 +505,7 @@ class TranscriptWatcher:
 
     def _tick(self) -> None:
         total = distill_all_transcripts(
-            self.transcript_dirs, self.cache_dir, self.output_dir,
+            self.transcript_dirs, self.conn, self.output_dir,
             gemma_every_n=self.gemma_every_n, use_gemma=self.use_gemma,
             flush_fn=self.flush_fn,
         )

@@ -1,103 +1,117 @@
-"""Hybrid search: BM25 keyword + vector cosine, fused via Reciprocal Rank Fusion."""
+"""Hybrid search: BM25 keyword + vector cosine via hnswlib, fused via Reciprocal Rank Fusion."""
 
 from __future__ import annotations
 
-import json
+import io
 import logging
 import math
 import re
+import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
+import hnswlib
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-from .indexer import embed_texts, load_index
+from . import db
+from .indexer import embed_texts
 
 log = logging.getLogger(__name__)
 
 MAX_INLINE_LINES = 50
 MAX_GROUP_TOKENS = 2048
-RRF_K = 60  # RRF constant — 60 is the standard default
+RRF_K = 60
 
-_CHARS_PER_TOKEN = 4  # rough estimate for grouping cap
-
-
-def _deprecated_path(cache_dir: str) -> Path:
-    return Path(cache_dir) / "deprecated.json"
-
-
-def load_deprecated(cache_dir: str) -> dict[str, str]:
-    """Load deprecated docs. Returns {path: reason}."""
-    p = _deprecated_path(cache_dir)
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def save_deprecated(cache_dir: str, deprecated: dict[str, str]) -> None:
-    p = _deprecated_path(cache_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(deprecated, indent=2))
+_CHARS_PER_TOKEN = 4
 
 
 def _tokenize(text: str) -> list[str]:
-    """Simple whitespace + punctuation tokenizer for BM25."""
     return re.findall(r"[a-z0-9_\-]+", text.lower())
 
 
 class Searcher:
-    def __init__(self, cache_dir: str, source_roots: dict[str, str] | None = None):
-        self.cache_dir = cache_dir
-        self.source_roots = source_roots or {}
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
         self._vectors: np.ndarray | None = None
         self._metadata: list[dict] | None = None
         self._bm25: BM25Okapi | None = None
-        self._hnsw = None  # hnswlib.Index or None
+        self._hnsw: hnswlib.Index | None = None
         self._deprecated: dict[str, str] = {}
 
     def _build_bm25(self) -> None:
-        """Build BM25 index from loaded metadata texts."""
         if not self._metadata:
             self._bm25 = None
             return
         corpus = [_tokenize(m.get("text", "")) for m in self._metadata]
         self._bm25 = BM25Okapi(corpus)
 
-    def _load_hnsw(self) -> None:
-        """Load hnswlib index if available and corpus is large enough."""
+    def _build_hnsw(self) -> None:
+        """Build hnswlib index from vectors. Try loading cached blob first."""
         self._hnsw = None
-        if self._vectors is None or len(self._vectors) < 5000:
+        if self._vectors is None or len(self._vectors) == 0:
             return
-        hnsw_path = Path(self.cache_dir) / "index.hnsw"
-        if not hnsw_path.exists():
+
+        dim = self._vectors.shape[1]
+        n = len(self._vectors)
+
+        cached = db.load_hnsw_cache(self.conn)
+        if cached is not None:
+            blob, cached_count = cached
+            if cached_count == n:
+                try:
+                    index = hnswlib.Index(space="cosine", dim=dim)
+                    with tempfile.NamedTemporaryFile(suffix=".hnsw", delete=False) as f:
+                        f.write(blob)
+                        tmp_path = f.name
+                    index.load_index(tmp_path, max_elements=n)
+                    Path(tmp_path).unlink(missing_ok=True)
+                    index.set_ef(50)
+                    self._hnsw = index
+                    log.info("Loaded cached hnswlib index (%d vectors)", n)
+                    return
+                except Exception as exc:
+                    log.warning("Failed to load cached HNSW, rebuilding: %s", exc)
+                    Path(tmp_path).unlink(missing_ok=True)
+
+        # Build fresh
+        index = hnswlib.Index(space="cosine", dim=dim)
+        index.init_index(max_elements=max(n, 1), ef_construction=200, M=16)
+        index.add_items(self._vectors, list(range(n)))
+        index.set_ef(50)
+        self._hnsw = index
+        log.info("Built hnswlib index (%d vectors)", n)
+
+        self._cache_hnsw()
+
+    def _cache_hnsw(self) -> None:
+        """Serialize current HNSW index and store in DB."""
+        if self._hnsw is None or self._vectors is None:
             return
         try:
-            import hnswlib
-            dim = self._vectors.shape[1]
-            index = hnswlib.Index(space="cosine", dim=dim)
-            index.load_index(str(hnsw_path), max_elements=len(self._vectors))
-            index.set_ef(50)
-            self._hnsw = index
-            log.info("Loaded hnswlib index (%d vectors)", len(self._vectors))
-        except ImportError:
-            pass
+            with tempfile.NamedTemporaryFile(suffix=".hnsw", delete=False) as f:
+                tmp_path = f.name
+            self._hnsw.save_index(tmp_path)
+            blob = Path(tmp_path).read_bytes()
+            Path(tmp_path).unlink(missing_ok=True)
+            db.save_hnsw_cache(self.conn, blob, len(self._vectors))
         except Exception as exc:
-            log.warning("Failed to load hnswlib index: %s", exc)
+            log.warning("Failed to cache HNSW index: %s", exc)
 
     def load(self) -> bool:
-        vecs, meta = load_index(self.cache_dir)
-        if vecs is None or meta is None:
-            log.warning("No index found at %s", self.cache_dir)
+        meta, vecs = db.load_all_chunks(self.conn)
+        if not meta:
+            log.warning("No chunks in database")
+            self._vectors = np.empty((0, 384), dtype=np.float32)
+            self._metadata = []
+            self._deprecated = db.load_deprecated(self.conn)
             return False
         self._vectors = vecs
         self._metadata = meta
-        self._deprecated = load_deprecated(self.cache_dir)
+        self._deprecated = db.load_deprecated(self.conn)
         self._build_bm25()
-        self._load_hnsw()
+        self._build_hnsw()
         log.info("Loaded index: %d chunks, %d deprecated docs", len(meta), len(self._deprecated))
         return True
 
@@ -118,18 +132,19 @@ class Searcher:
         return counts
 
     def _vector_search(self, query_text: str, n: int, source: str | None) -> list[tuple[int, int]]:
-        """Return [(index, rank)] from vector cosine similarity. Uses HNSW if available."""
-        if self._vectors is None or self._metadata is None:
+        """Return [(index, rank)] from vector similarity. Uses HNSW when no source filter."""
+        if self._vectors is None or self._metadata is None or len(self._vectors) == 0:
             return []
 
         query_vec = embed_texts([query_text])[0]
 
-        # HNSW path: fast ANN for large corpora (no source filtering at ANN level)
         if self._hnsw is not None and source is None:
-            labels, distances = self._hnsw.knn_query(query_vec.reshape(1, -1), k=min(n, len(self._vectors)))
+            labels, _distances = self._hnsw.knn_query(
+                query_vec.reshape(1, -1), k=min(n, len(self._vectors)),
+            )
             return [(int(labels[0][i]), i) for i in range(len(labels[0]))]
 
-        # Brute-force path
+        # Brute-force fallback for source-filtered queries
         norms = np.linalg.norm(self._vectors, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1, norms)
         normed = self._vectors / norms
@@ -145,7 +160,6 @@ class Searcher:
         return [(int(idx), rank) for rank, idx in enumerate(top_indices) if scores[idx] >= 0]
 
     def _bm25_search(self, query_text: str, n: int, source: str | None) -> list[tuple[int, int]]:
-        """Return [(index, rank)] from BM25 keyword search."""
         if self._bm25 is None or self._metadata is None:
             return []
 
@@ -168,7 +182,6 @@ class Searcher:
         bm25_results: list[tuple[int, int]],
         top_k: int,
     ) -> tuple[list[int], dict[int, float]]:
-        """Reciprocal Rank Fusion: combine two ranked lists into one."""
         rrf_scores: dict[int, float] = {}
         for idx, rank in vector_results:
             rrf_scores[idx] = rrf_scores.get(idx, 0.0) + 1.0 / (RRF_K + rank)
@@ -192,7 +205,6 @@ class Searcher:
         bm25_results = self._bm25_search(query_text, candidate_n, source)
         fused_indices, rrf_scores = self._rrf_fuse(vector_results, bm25_results, top_k)
 
-        # Freshness boost: recent docs get a small additive bump that decays over ~1 week
         now = time.time()
         for idx in fused_indices:
             indexed_at = self._metadata[idx].get("indexed_at", "")
@@ -204,26 +216,23 @@ class Searcher:
                 except (ValueError, OverflowError):
                     pass
 
-        # Score-gap filtering: drop results below mean + 1.5σ
         if len(fused_indices) > 1:
             scores_arr = np.array([rrf_scores[i] for i in fused_indices])
             threshold = scores_arr.mean() + 1.5 * scores_arr.std()
             fused_indices = [i for i in fused_indices if rrf_scores[i] >= threshold]
             if not fused_indices:
-                # Keep at least the top result
                 fused_indices = [max(rrf_scores, key=rrf_scores.get)]
 
         results = []
-        session_groups: dict[str, dict] = {}  # path -> merged result
+        session_groups: dict[str, dict] = {}
 
         for idx in fused_indices:
             meta = self._metadata[idx]
             text = meta.get("text", "")
             doc_path = meta.get("path", "")
-            source = meta.get("source", "")
+            src = meta.get("source", "")
 
-            # Session chunks: group by path and return distilled summary
-            if source == "sessions":
+            if src == "sessions":
                 turn_label = meta.get("section_heading", "")
                 if doc_path in session_groups:
                     group = session_groups[doc_path]
@@ -249,10 +258,9 @@ class Searcher:
                     session_groups[doc_path]["text"] = text
                 continue
 
-            # Non-session chunks: standard result building
             line_count = text.count("\n") + 1
             result: dict = {
-                "source": source,
+                "source": src,
                 "path": doc_path,
                 "section": meta.get("section_heading", ""),
                 "score": round(rrf_scores[idx], 4),
@@ -282,10 +290,8 @@ class Searcher:
 
             results.append(result)
 
-        # Group non-session results from the same document
         results = self._group_document_results(results)
 
-        # Insert session results and sort everything by score
         for group in session_groups.values():
             results.append(group)
         results.sort(key=lambda r: r.get("score", 0), reverse=True)
@@ -294,11 +300,7 @@ class Searcher:
 
     def _group_document_results(self, results: list[dict]) -> list[dict]:
         """Merge multiple results from the same file into one contiguous block."""
-        if not self.source_roots:
-            return results
-
         groups: dict[tuple[str, str], list[dict]] = {}
-        singles: list[dict] = []
 
         for r in results:
             key = (r.get("source", ""), r.get("path", ""))
@@ -310,8 +312,9 @@ class Searcher:
                 merged.append(items[0])
                 continue
 
-            root = self.source_roots.get(src)
-            if not root:
+            # Read full doc content from DB
+            content = db.get_document_content(self.conn, src, path)
+            if not content:
                 merged.extend(items)
                 continue
 
@@ -323,14 +326,7 @@ class Searcher:
                 merged.extend(items)
                 continue
 
-            # Read the file range between first and last matching chunk
-            full_path = Path(root) / path
-            try:
-                all_lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                merged.extend(items)
-                continue
-
+            all_lines = content.splitlines()
             slice_text = "\n".join(all_lines[first_line - 1 : last_line])
             est_tokens = len(slice_text) // _CHARS_PER_TOKEN
             if est_tokens > MAX_GROUP_TOKENS:
