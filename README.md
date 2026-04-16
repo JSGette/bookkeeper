@@ -5,11 +5,15 @@ MCP server for semantic search over local documentation, source code, and chat s
 ## Architecture
 
 ```
-Documents/Code → Multi-format Chunker → Tagger (path + LLM + overrides) → Embedder (MiniLM) → Vector index
-                                                                                                    ↑
-Cursor agent → MCP tool call → Hybrid search (BM25 + vector + RRF) → Top-K chunks returned ────────┘
+Documents/Code → Chunker → Tagger → Embedder (MiniLM) → Vector index
+                     ↓                                        ↑
+              Doc Summarizer (Gemma) → documents.summary      │
+                                                              │
+Cursor agent → MCP tool call → Hybrid search (BM25+vector+RRF) → Summaries + pointers returned
+                                       │
+                                   Audit log (query_log table)
 
-Transcripts → Background Watcher → Turn-level Parser → Gemma Summarizer → Session index ───────────┘
+Transcripts → Background Watcher → Turn Parser → Gemma Summarizer → Session index
 ```
 
 ### Components
@@ -18,22 +22,25 @@ Transcripts → Background Watcher → Turn-level Parser → Gemma Summarizer �
 |--------|---------|
 | `chunker.py` | Multi-format chunking: markdown at `##` headings, source code via treesitter (optional) or fixed-size, with a configurable token ceiling |
 | `tagger.py` | Three-layer tagging: path-based → LLM via Ollama (cached) → manual `.agents-rag-meta.yaml` overrides. Prompt and examples are configurable |
-| `indexer.py` | Embeds chunks with `all-MiniLM-L6-v2`, persists to cache dir. Git-based delta reindex, mtime fallback. Preserves session chunks across reindex. Optional HNSW for large corpora |
-| `searcher.py` | Hybrid BM25 + vector cosine search fused via RRF. Score-gap filtering and freshness boost |
+| `indexer.py` | Embeds chunks with `all-MiniLM-L6-v2`, generates document-level summaries via Gemma, persists to SQLite. Git-based delta reindex, mtime fallback. Optional HNSW for large corpora |
+| `searcher.py` | Hybrid BM25 + vector cosine search fused via RRF. Returns document summaries + pointers instead of raw chunks. Configurable score-gap filtering and freshness boost |
 | `transcript.py` | Parses Cursor agent transcripts into turn-level chunks with heuristic extraction and optional Gemma summarization. Background watcher flushes each transcript to the index immediately |
 | `index_generator.py` | Regenerates `INDEX.md` for sources with `generate_index: true` |
-| `server.py` | FastMCP stdio server exposing the tools below, plus background transcript watcher |
+| `db.py` | SQLite storage backend: documents (with summaries), chunks, vectors, state, and query audit log |
+| `server.py` | FastMCP stdio server exposing the tools below, plus background transcript watcher and query audit logging |
 
 ### MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `query_knowledge_base(query, top_k, source)` | Hybrid semantic + keyword search across indexed docs and sessions |
+| `query_knowledge_base(query, max_results, source)` | Hybrid semantic + keyword search. Returns document summaries and pointers, not raw text |
+| `get_full_document(path, source)` | Retrieve the full content of a document when the summary isn't sufficient |
 | `reindex(source)` | Rebuild index (incremental via git diff). Session chunks are preserved |
 | `list_sources()` | Show configured sources and chunk counts |
 | `deprecate_doc(path, reason, undeprecate)` | Mark/unmark a doc as outdated |
 | `save_session(title, summary, ...)` | Persist a structured session summary for future retrieval |
 | `distill_transcripts()` | Force immediate scan and indexing of transcript directories |
+| `query_audit_log(limit)` | Return recent queries and their results for auditing |
 
 ## Setup
 
@@ -89,6 +96,10 @@ sessions:
   gemma_every_n_turns: 3        # re-summarize with Gemma every N new turns
   watch_interval_minutes: 5     # background scan interval (0 to disable)
 
+search:
+  score_threshold_z: 0.8        # z-score multiplier for result filtering (default 0.8)
+  min_results: 2                # minimum results returned per query (default 2)
+
 model: all-MiniLM-L6-v2
 cache_dir: ~/.cache/agents-rag
 use_gemma: true
@@ -107,16 +118,19 @@ use_gemma: true
 
 ## Agent Usage Guidelines
 
-Query results are **prior notes and hypotheses, not ground truth** — they may be outdated.
+Query results are **prior notes and hypotheses, not ground truth** — they may be outdated. Results contain **summaries**, not raw text.
 
 1. Call `query_knowledge_base` with a short natural-language query.
 2. Use `source` to filter by name, or omit to search all.
 3. Prefer recently indexed docs — check `indexed_at`.
-4. If a doc **references source files**, read those too — the doc is a pointer, the code is the truth.
-5. **Verify factual claims** against current source code before repeating them.
-6. `"deprecated": true` means historical context only.
-7. If a doc is **contradicted by current code**, call `deprecate_doc`.
-8. At the end of a work session, call `save_session` with a structured summary.
+4. **Document results** contain a `summary` (doc-level overview) and `matched_sections` showing which sections triggered the match.
+5. **Session results** contain a `session_summary` (distilled overview with decisions and next steps).
+6. If the summary is sufficient, use it directly. If you need exact code or full context, call `get_full_document` with the result's `path` and `source`.
+7. If a doc **references source files**, read those too — the doc is a pointer, the code is the truth.
+8. **Verify factual claims** against current source code before repeating them.
+9. `"deprecated": true` means historical context only.
+10. If a doc is **contradicted by current code**, call `deprecate_doc`.
+11. At the end of a work session, call `save_session` with a structured summary.
 
 ## Session Memory
 
@@ -153,7 +167,7 @@ Two retrieval paths fused via Reciprocal Rank Fusion (RRF, k=60):
 1. **BM25** — keyword matching via `rank-bm25`
 2. **Vector cosine** — semantic matching via `all-MiniLM-L6-v2`
 
-Post-fusion: score-gap filtering (mean + 1.5σ threshold) removes noise. Freshness boost (time-decay over ~1 week) promotes recent docs. For corpora >5000 chunks, optional `hnswlib` provides sub-ms ANN search.
+Post-fusion: score-gap filtering (configurable z-score threshold, default 0.8σ) removes noise while guaranteeing at least `min_results` (default 2). Freshness boost (time-decay over ~1 week) promotes recent docs. For corpora >5000 chunks, optional `hnswlib` provides sub-ms ANN search.
 
 ## LLM Tagging
 
@@ -198,6 +212,7 @@ Endpoints:
 | `GET /` | Single-page HTML app |
 | `GET /api/chunks` | All chunk metadata (text replaced with a 200-char preview) |
 | `GET /api/stats` | Aggregate counts: total chunks, per-source, per-tag, deprecated |
+| `GET /api/queries?limit=50` | Recent query audit log (query text, results, latency) |
 
 The UI loads all metadata client-side and filters by keyword (path, title, heading, description, tags) and/or selected tags. No semantic search — use the MCP `query_knowledge_base` tool for that.
 
