@@ -45,3 +45,8 @@ sessions:
 model: BAAI/bge-small-en-v1.5
 cache_dir: ~/.cache/agents-rag
 use_gemma: true
+
+reranker:
+  enabled: true
+  model: BAAI/bge-reranker-base
+  pool_multiplier: 6

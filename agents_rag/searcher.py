@@ -16,10 +16,12 @@ from rank_bm25 import BM25Okapi
 
 from . import db
 from .indexer import embed_texts
+from .reranker import rerank as _rerank_fn
 
 log = logging.getLogger(__name__)
 
 RRF_K = 60
+_RERANK_PASSAGE_CHARS = 2000
 
 
 def _tokenize(text: str) -> list[str]:
@@ -27,19 +29,36 @@ def _tokenize(text: str) -> list[str]:
 
 
 class Searcher:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        reranker_enabled: bool = False,
+        reranker_model: str = "BAAI/bge-reranker-base",
+        reranker_pool_multiplier: int = 6,
+    ):
         self.conn = conn
         self._vectors: np.ndarray | None = None
         self._metadata: list[dict] | None = None
         self._bm25: BM25Okapi | None = None
         self._hnsw: hnswlib.Index | None = None
         self._deprecated: dict[str, str] = {}
+        self._reranker_enabled = reranker_enabled
+        self._reranker_model = reranker_model
+        self._reranker_pool_multiplier = max(1, reranker_pool_multiplier)
 
     def _build_bm25(self) -> None:
         if not self._metadata:
             self._bm25 = None
             return
-        corpus = [_tokenize(m.get("text", "")) for m in self._metadata]
+        corpus = []
+        for m in self._metadata:
+            tokens = _tokenize(m.get("text", ""))
+            # Boost title and heading matches by repeating their tokens
+            title_tokens = _tokenize(m.get("doc_title", ""))
+            heading_tokens = _tokenize(m.get("section_heading", ""))
+            tag_tokens = _tokenize(" ".join(m.get("tags", [])))
+            tokens = title_tokens * 2 + heading_tokens * 2 + tag_tokens + tokens
+            corpus.append(tokens)
         self._bm25 = BM25Okapi(corpus)
 
     def _build_hnsw(self) -> None:
@@ -186,6 +205,34 @@ class Searcher:
         sorted_indices = sorted(rrf_scores, key=lambda i: rrf_scores[i], reverse=True)
         return sorted_indices[:top_k], rrf_scores
 
+    def _passage_for_rerank(self, idx: int) -> str:
+        m = self._metadata[idx] if self._metadata else {}
+        parts = [
+            m.get("doc_title", ""),
+            m.get("section_heading", ""),
+            m.get("text", ""),
+        ]
+        return "\n".join(p for p in parts if p)[:_RERANK_PASSAGE_CHARS]
+
+    def _rerank_pool(
+        self,
+        query_text: str,
+        fused_indices: list[int],
+        rrf_scores: dict[int, float],
+    ) -> tuple[list[int], dict[int, float]]:
+        """Rescore fused candidates with the cross-encoder. Falls back to RRF on failure."""
+        if not self._reranker_enabled or len(fused_indices) <= 1 or self._metadata is None:
+            return fused_indices, rrf_scores
+
+        passages = [self._passage_for_rerank(i) for i in fused_indices]
+        scores = _rerank_fn(query_text, passages, model_name=self._reranker_model)
+        if scores is None or len(scores) != len(fused_indices):
+            return fused_indices, rrf_scores
+
+        new_scores = {idx: float(scores[i]) for i, idx in enumerate(fused_indices)}
+        ordered = sorted(fused_indices, key=lambda i: new_scores[i], reverse=True)
+        return ordered, new_scores
+
     def query(
         self,
         query_text: str,
@@ -197,11 +244,19 @@ class Searcher:
         if self._vectors is None or self._metadata is None or len(self._metadata) == 0:
             return []
 
-        candidate_n = top_k * 3
+        rerank_pool = top_k * self._reranker_pool_multiplier if self._reranker_enabled else top_k
+        candidate_n = max(top_k * 3, rerank_pool)
         vector_results = self._vector_search(query_text, candidate_n, source)
         bm25_results = self._bm25_search(query_text, candidate_n, source)
-        fused_indices, rrf_scores = self._rrf_fuse(vector_results, bm25_results, top_k)
+        fused_indices, scores = self._rrf_fuse(vector_results, bm25_results, rerank_pool)
 
+        fused_indices, scores = self._rerank_pool(query_text, fused_indices, scores)
+        fused_indices = fused_indices[:top_k]
+
+        # Freshness boost — scaled so it's a tiebreaker regardless of score origin.
+        # RRF scores sit near 1/60; reranker sigmoid scores sit in [0,1]. 0.01 nudges
+        # either without overriding substantive relevance differences.
+        boost_scale = 0.01 if self._reranker_enabled else 0.005
         now = time.time()
         for idx in fused_indices:
             indexed_at = self._metadata[idx].get("indexed_at", "")
@@ -209,20 +264,21 @@ class Searcher:
                 try:
                     ts = time.mktime(time.strptime(indexed_at, "%Y-%m-%dT%H:%M:%SZ"))
                     age_hours = max(0, (now - ts) / 3600)
-                    rrf_scores[idx] += 0.005 * math.exp(-age_hours / (24 * 7))
+                    scores[idx] += boost_scale * math.exp(-age_hours / (24 * 7))
                 except (ValueError, OverflowError):
                     pass
 
         if len(fused_indices) > 1:
-            scores_arr = np.array([rrf_scores[i] for i in fused_indices])
+            scores_arr = np.array([scores[i] for i in fused_indices])
             threshold = scores_arr.mean() + score_threshold_z * scores_arr.std()
-            filtered = [i for i in fused_indices if rrf_scores[i] >= threshold]
-            # Guarantee at least min_results (or all candidates if fewer exist)
+            filtered = [i for i in fused_indices if scores[i] >= threshold]
             if len(filtered) < min(min_results, len(fused_indices)):
-                filtered = sorted(fused_indices, key=lambda i: rrf_scores[i], reverse=True)[
+                filtered = sorted(fused_indices, key=lambda i: scores[i], reverse=True)[
                     :min(min_results, len(fused_indices))
                 ]
             fused_indices = filtered
+
+        rrf_scores = scores
 
         results = []
         session_groups: dict[str, dict] = {}

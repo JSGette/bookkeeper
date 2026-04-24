@@ -96,8 +96,18 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     score_threshold_z = float(search_config.get("score_threshold_z", 0.8))
     min_results = int(search_config.get("min_results", 2))
 
+    reranker_config = config.get("reranker", {})
+    reranker_enabled = bool(reranker_config.get("enabled", True))
+    reranker_model = reranker_config.get("model", "BAAI/bge-reranker-base")
+    reranker_pool_multiplier = int(reranker_config.get("pool_multiplier", 6))
+
     conn = db.init_db(db_path)
-    searcher = Searcher(conn)
+    searcher = Searcher(
+        conn,
+        reranker_enabled=reranker_enabled,
+        reranker_model=reranker_model,
+        reranker_pool_multiplier=reranker_pool_multiplier,
+    )
 
     # Index queue — serialises all embed-merge-save-reload work on a single thread
     index_q: queue.Queue[list[dict] | None] = queue.Queue()
