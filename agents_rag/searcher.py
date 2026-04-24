@@ -50,14 +50,17 @@ class Searcher:
         if not self._metadata:
             self._bm25 = None
             return
+        # Title, heading, and tags are mixed into the tokenized body once — not
+        # doubled. Doubling was boosting generic auto-derived titles (slash
+        # commands, first-query-as-title session names) so every query sharing a
+        # word with the title pinned that doc to the top of BM25.
         corpus = []
         for m in self._metadata:
             tokens = _tokenize(m.get("text", ""))
-            # Boost title and heading matches by repeating their tokens
             title_tokens = _tokenize(m.get("doc_title", ""))
             heading_tokens = _tokenize(m.get("section_heading", ""))
             tag_tokens = _tokenize(" ".join(m.get("tags", [])))
-            tokens = title_tokens * 2 + heading_tokens * 2 + tag_tokens + tokens
+            tokens = title_tokens + heading_tokens + tag_tokens + tokens
             corpus.append(tokens)
         self._bm25 = BM25Okapi(corpus)
 

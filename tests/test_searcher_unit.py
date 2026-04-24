@@ -359,3 +359,63 @@ def test_passage_for_rerank_truncates_long_text(tmp_path):
     huge = "x" * 10_000
     searcher._metadata = [{"doc_title": "T", "section_heading": "H", "text": huge}]
     assert len(searcher._passage_for_rerank(0)) <= 2000
+
+
+# ---------------------------------------------------------------------------
+# BM25 title-boost regression (Proposal 6)
+# ---------------------------------------------------------------------------
+
+
+def test_bm25_title_tokens_not_doubled(tmp_path):
+    """Title tokens appear exactly once in the BM25 corpus, not twice.
+
+    Previously title_tokens * 2 caused auto-derived titles (slash commands,
+    session titles) to pin their doc atop any query sharing a title word.
+    """
+    conn = init_db(str(tmp_path / "test.db"))
+    doc_id = upsert_document(conn, "docs", "a.md", "bazel migration plan", "", "body")
+    chunk = {
+        "section_heading": "intro",
+        "start_line": 0, "end_line": 0,
+        "text": "body paragraph",
+        "tags": ["planning"],
+        "description": "", "doc_preamble": "",
+    }
+    upsert_chunks(conn, doc_id, [chunk], _fake_embed([chunk["text"]]))
+
+    searcher = Searcher(conn)
+    searcher.load()
+
+    # Reach into the built corpus to count token occurrences.
+    corpus_tokens = searcher._bm25.corpus_size  # sanity
+    assert corpus_tokens == 1
+    tokenized = _tokenize("bazel migration plan intro planning body paragraph")
+    # Each vocabulary word appears at most once.
+    for tok in ("bazel", "migration", "plan", "intro", "planning"):
+        count = searcher._bm25.doc_freqs[0].get(tok, 0)
+        assert count == 1, f"{tok!r} occurs {count} times, expected 1"
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_bm25_scores_body_match_above_title_only_match(mock_embed, tmp_path):
+    """BM25 alone: a doc whose body answers the query should outrank a doc
+    whose title merely shares one word with the query. Previously title
+    tokens were doubled, so the title_only doc often won."""
+    conn = init_db(str(tmp_path / "test.db"))
+    # Noise docs push IDF positive for the query terms.
+    _insert_doc_chunks(conn, [
+        ("noise1.md", "cooking tips", [("s", "pasta recipes and tomato sauces")]),
+        ("noise2.md", "garden notes", [("s", "houseplants and succulents watering")]),
+        ("noise3.md", "travel log",   [("s", "trip to the alps last summer")]),
+        ("title_only.md", "bazel quickstart",
+         [("intro", "this document discusses gardening tips and houseplants")]),
+        ("body_match.md", "internal tools",
+         [("migration", "bazel migration plan details with build graph rewiring")]),
+    ])
+    searcher = Searcher(conn)
+    searcher.load()
+
+    bm25_hits = searcher._bm25_search("bazel migration plan", n=10, source=None)
+    assert bm25_hits, "expected at least one BM25 match"
+    top_idx = bm25_hits[0][0]
+    assert searcher._metadata[top_idx]["path"] == "body_match.md"
