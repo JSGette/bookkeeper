@@ -293,7 +293,8 @@ class Searcher:
                 turn_label = meta.get("section_heading", "")
                 if doc_path in session_groups:
                     group = session_groups[doc_path]
-                    group["matched_turns"].append(turn_label)
+                    if turn_label:
+                        group["matched_turns"].append(turn_label)
                     group["score"] = max(group["score"], round(rrf_scores[idx], 4))
                     continue
 
@@ -304,10 +305,11 @@ class Searcher:
                     "tags": meta.get("tags", []),
                     "description": meta.get("doc_title", ""),
                     "indexed_at": meta.get("indexed_at", ""),
-                    "matched_turns": [turn_label],
                     "full_session_path": meta.get("full_session_path", ""),
                     "session_turn_count": meta.get("session_turn_count", 0),
                 }
+                if turn_label:
+                    session_groups[doc_path]["matched_turns"] = [turn_label]
                 summary = meta.get("session_summary", "")
                 if summary:
                     session_groups[doc_path]["session_summary"] = summary

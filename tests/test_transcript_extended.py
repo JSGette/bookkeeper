@@ -13,8 +13,9 @@ import pytest
 from agents_rag.db import init_db, save_transcript_state
 from agents_rag.transcript import (
     Turn,
-    _build_turn_embedding_text,
+    _aggregate_tags,
     _format_session_summary,
+    _session_embedding_text,
     _turn_to_markdown,
     distill_all_transcripts,
     distill_transcript,
@@ -198,39 +199,69 @@ def test_distill_all_transcripts_nonexistent_dir(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Turn embedding text composition (Proposal 2)
+# Session chunk composition (Proposals 2 + 5)
 # ---------------------------------------------------------------------------
 
 
-def test_build_turn_embedding_text_with_summary():
-    turn = Turn(index=0, user_query="How do I cache?", assistant_text="Use Redis.")
-    text = _build_turn_embedding_text(
-        title="Cache design",
-        session_summary="We picked Redis over Memcached for pub/sub support.",
-        turn=turn,
-        turn_text="## Turn 1: How do I cache?\n- Conclusion: Redis.",
+def test_session_embedding_text_includes_title_summary_and_headings():
+    turns = [
+        Turn(index=0, user_query="How do I cache?", assistant_text="A"),
+        Turn(index=1, user_query="What eviction policy?", assistant_text="B"),
+    ]
+    text = _session_embedding_text(
+        "Cache design",
+        "We picked Redis over Memcached for pub/sub support.",
+        turns,
     )
     assert "Cache design" in text
     assert "Redis over Memcached" in text
-    assert "How do I cache?" in text
-    assert "Turn 1" in text
+    assert "Turn 1: How do I cache?" in text
+    assert "Turn 2: What eviction policy?" in text
 
 
-def test_build_turn_embedding_text_without_summary():
-    turn = Turn(index=0, user_query="Q", assistant_text="A")
-    text = _build_turn_embedding_text("Title", "", turn, "body")
+def test_session_embedding_text_without_summary():
+    turns = [Turn(index=0, user_query="Q", assistant_text="A")]
+    text = _session_embedding_text("Title", "", turns)
     assert "Title" in text
-    assert "Q" in text
-    assert "body" in text
+    assert "Turn 1: Q" in text
 
 
-def test_build_turn_embedding_text_caps_summary_length():
-    turn = Turn(index=0, user_query="Q", assistant_text="A")
+def test_session_embedding_text_caps_summary_length():
+    turns = [Turn(index=0, user_query="Q", assistant_text="A")]
     huge = "x" * 5000
-    text = _build_turn_embedding_text("T", huge, turn, "body")
-    # Summary portion alone must not exceed the cap
+    text = _session_embedding_text("T", huge, turns)
+    # Summary portion alone must not exceed the cap.
     assert huge not in text
     assert "x" * 400 in text
+
+
+def test_aggregate_tags_combines_transcript_and_path_tags():
+    turns = [
+        Turn(
+            index=0, user_query="Q", assistant_text="",
+            files_read=["/repo/agents_rag/searcher.py"],
+            files_edited=["/repo/agents_rag/indexer.py"],
+        ),
+    ]
+    tags = _aggregate_tags(turns, transcript_tags=["rag", "retrieval"])
+    assert "rag" in tags
+    assert "retrieval" in tags
+    assert "searcher" in tags
+    # Must not extract query words.
+    assert "q" not in tags
+
+
+def test_aggregate_tags_dedups_and_caps():
+    turns = [
+        Turn(
+            index=i, user_query="Q", assistant_text="",
+            files_read=[f"/a/mod_{i}.py" for _ in range(3)],
+        )
+        for i in range(20)
+    ]
+    tags = _aggregate_tags(turns, transcript_tags=["rag"])
+    assert len(tags) <= 15
+    assert len(set(tags)) == len(tags)
 
 
 def test_distill_produces_embedding_text_field(tmp_path):

@@ -113,7 +113,12 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     index_q: queue.Queue[list[dict] | None] = queue.Queue()
 
     def _index_worker() -> None:
-        """Drain the queue in batches: embed new chunks, merge into DB, reload searcher."""
+        """Drain the queue in batches: embed new chunks, merge into DB, reload searcher.
+
+        Session chunks (source == "sessions") are upserted per document — there is
+        exactly one chunk per session, and it must replace prior ones on every tick.
+        Non-session chunks retain append-with-dedup semantics.
+        """
         while True:
             batch = index_q.get()
             if batch is None:
@@ -126,41 +131,54 @@ def create_app(config_override: dict | None = None) -> FastMCP:
                 except queue.Empty:
                     break
             try:
-                existing_meta, _ = db.load_all_chunks(conn)
-                existing_keys = {
-                    (m["source"], m["path"], m.get("section_heading", ""))
-                    for m in existing_meta
-                } if existing_meta else set()
+                session_chunks = [c for c in batch if c.get("source") == "sessions"]
+                other_chunks = [c for c in batch if c.get("source") != "sessions"]
 
-                batch = [
-                    c for c in batch
-                    if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
-                ]
-                if not batch:
-                    log.info("Index queue: all chunks already present, skipping")
+                if other_chunks:
+                    existing_meta, _ = db.load_all_chunks(conn)
+                    existing_keys = {
+                        (m["source"], m["path"], m.get("section_heading", ""))
+                        for m in existing_meta
+                    } if existing_meta else set()
+                    other_chunks = [
+                        c for c in other_chunks
+                        if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
+                    ]
+
+                effective = session_chunks + other_chunks
+                if not effective:
+                    log.info("Index queue: nothing to flush")
                     continue
 
-                texts = [c.get("embedding_text") or c["text"] for c in batch]
+                texts = [c.get("embedding_text") or c["text"] for c in effective]
                 new_vecs = embed_texts(texts)
 
                 by_doc: dict[tuple[str, str], list[tuple[dict, int]]] = {}
-                for i, c in enumerate(batch):
+                for i, c in enumerate(effective):
                     key = (c["source"], c["path"])
                     by_doc.setdefault(key, []).append((c, i))
 
                 for (src, path), items in by_doc.items():
-                    doc_id = db.get_document_id(conn, src, path)
-                    if doc_id is None:
-                        content = items[0][0].get("text", "")
-                        title = items[0][0].get("doc_title", "")
-                        doc_id = db.upsert_document(conn, src, path, title, "", content)
                     chunk_metas = [c for c, _ in items]
                     chunk_indices = [idx for _, idx in items]
                     chunk_vecs = new_vecs[chunk_indices]
-                    db.append_chunks(conn, doc_id, chunk_metas, chunk_vecs)
+                    title = items[0][0].get("doc_title", "")
+
+                    if src == "sessions":
+                        summary = items[0][0].get("session_summary", "")
+                        content = items[0][0].get("text", "")
+                        doc_id = db.upsert_document(conn, src, path, title, "", content, summary=summary)
+                        db.upsert_chunks(conn, doc_id, chunk_metas, chunk_vecs)
+                    else:
+                        doc_id = db.get_document_id(conn, src, path)
+                        if doc_id is None:
+                            content = items[0][0].get("text", "")
+                            doc_id = db.upsert_document(conn, src, path, title, "", content)
+                        db.append_chunks(conn, doc_id, chunk_metas, chunk_vecs)
 
                 searcher.reload()
-                log.info("Index queue: flushed %d chunks", len(batch))
+                log.info("Index queue: flushed %d chunks (%d session, %d other)",
+                         len(effective), len(session_chunks), len(other_chunks))
             except Exception:
                 log.exception("Index queue: flush failed")
 

@@ -258,49 +258,95 @@ def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Turn-level tagging
+# Session-level chunk builder
 # ---------------------------------------------------------------------------
 
-def tag_turn(turn: Turn, transcript_tags: list[str]) -> list[str]:
-    """Combine transcript-level tags with file-path tags for this turn.
+_SUMMARY_EMBEDDING_CAP = 400
+_TURN_HEADING_CAP = 120
+_SESSION_TAG_CAP = 15
 
-    Intentionally does NOT extract words from user_query: doing so pollutes the
-    BM25 corpus (tags are doubled in the corpus build), making every turn match
-    any query that happens to share a common word with the original user
-    question. Transcript-level gemma tags + file-path tags are enough signal.
+
+def _aggregate_tags(turns: list[Turn], transcript_tags: list[str]) -> list[str]:
+    """Combine transcript-level gemma tags with file-path tags from every turn.
+
+    Deliberately avoids pulling words out of user queries — those pollute BM25
+    (tags get doubled in the corpus).
     """
-    turn_tags: list[str] = []
-    for f in turn.files_read + turn.files_edited:
-        turn_tags.extend(tags_from_path(f))
+    path_tags: list[str] = []
+    for t in turns:
+        for f in t.files_read + t.files_edited:
+            path_tags.extend(tags_from_path(f))
 
     seen: set[str] = set()
     deduped: list[str] = []
-    for t in transcript_tags + turn_tags:
-        t = t.lower().strip()
-        if t and t not in seen:
-            seen.add(t)
-            deduped.append(t)
-    return deduped[:10]
+    for tag in transcript_tags + path_tags:
+        tag = tag.lower().strip()
+        if tag and tag not in seen:
+            seen.add(tag)
+            deduped.append(tag)
+    return deduped[:_SESSION_TAG_CAP]
 
 
-_SUMMARY_EMBEDDING_CAP = 400
+def _session_chunk_text(turns: list[Turn], session_summary: str) -> str:
+    """Body of the single session chunk: summary (if any) plus the list of turn headings."""
+    headings = [f"- Turn {t.index + 1}: {t.user_query[:_TURN_HEADING_CAP]}" for t in turns]
+    parts: list[str] = []
+    if session_summary:
+        parts.extend(["## Session Summary", "", session_summary, ""])
+    parts.extend(["## Turns", "", *headings])
+    return "\n".join(parts)
 
 
-def _build_turn_embedding_text(
-    title: str, session_summary: str, turn: Turn, turn_text: str,
-) -> str:
-    """Compose the text fed to the embedder for a session turn chunk.
-
-    Pulls session-level context (title + gemma/authored summary) into the vector
-    so semantic queries match on session intent, not just the 3-line turn body.
-    """
-    parts = [title] if title else []
+def _session_embedding_text(title: str, session_summary: str, turns: list[Turn]) -> str:
+    """Vector-input text: title + capped summary + turn headings only."""
+    headings = "\n".join(
+        f"Turn {t.index + 1}: {t.user_query[:_TURN_HEADING_CAP]}" for t in turns
+    )
+    parts: list[str] = []
+    if title:
+        parts.append(title)
     if session_summary:
         parts.append(session_summary[:_SUMMARY_EMBEDDING_CAP])
-    if turn.user_query:
-        parts.append(turn.user_query)
-    parts.append(turn_text)
+    if headings:
+        parts.append(headings)
     return "\n".join(parts)
+
+
+def _build_session_chunk(
+    *,
+    title: str,
+    summary_path: str,
+    output_dir: str,
+    all_turns: list[Turn],
+    transcript_tags: list[str],
+    session_summary_text: str,
+    total_turns: int,
+) -> dict:
+    """Produce the single session chunk (replaces any prior chunk for this path)."""
+    text = _session_chunk_text(all_turns, session_summary_text)
+    embedding = _session_embedding_text(title, session_summary_text, all_turns)
+    tags = _aggregate_tags(all_turns, transcript_tags)
+    description = (session_summary_text or title)[:200]
+
+    chunk: dict = {
+        "source": "sessions",
+        "path": os.path.relpath(summary_path, os.path.expanduser(output_dir)),
+        "doc_title": title,
+        "section_heading": "",
+        "start_line": 0,
+        "end_line": 0,
+        "tags": tags,
+        "description": description,
+        "text": text,
+        "embedding_text": embedding,
+        "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "full_session_path": summary_path,
+        "session_turn_count": total_turns,
+        "replace_doc": True,
+    }
+    if session_summary_text:
+        chunk["session_summary"] = session_summary_text
+    return chunk
 
 
 def _format_session_summary(gemma_summary: dict) -> str:
@@ -372,51 +418,41 @@ def distill_transcript(
     else:
         title = state.get("title", "Untitled Session")
 
-    total_turns = turns_processed + len(new_turns)
+    # Re-parse the full transcript so the session chunk always reflects every turn,
+    # not just the new ones. The chunk is upserted per call.
+    all_turns = parse_turns(content)
+    for i, t in enumerate(all_turns):
+        t.index = i
+    total_turns = len(all_turns)
+
     gemma_summary = None
     transcript_tags: list[str] = state.get("transcript_tags", [])
     session_summary_text: str = state.get("gemma_summary_text", "")
 
-    all_turns: list[Turn] | None = None
     if use_gemma and (total_turns - gemma_summary_turn) >= gemma_every_n:
-        all_turns = parse_turns(content)
-        for i, t in enumerate(all_turns):
-            t.index = i
         gemma_summary = summarize_with_gemma(all_turns, content[-50_000:])
         if gemma_summary:
             transcript_tags = gemma_summary.get("tags", [])
             gemma_summary_turn = total_turns
             session_summary_text = _format_session_summary(gemma_summary)
 
-    if turns_processed == 0:
-        write_summary_file(summary_path, transcript_id, title, new_turns, gemma_summary)
+    # Markdown summary file (consumed by the personal source + get_full_document).
+    # Full rewrite on first pass or whenever gemma refreshes the summary; otherwise
+    # append just the new turns to avoid re-emitting the whole file.
+    if turns_processed == 0 or gemma_summary:
+        write_summary_file(summary_path, transcript_id, title, all_turns, gemma_summary)
     else:
         write_summary_file(summary_path, transcript_id, title, new_turns, append=True)
-        if gemma_summary and all_turns is not None:
-            write_summary_file(summary_path, transcript_id, title, all_turns, gemma_summary)
 
-    new_chunks = []
-    for turn in new_turns:
-        turn_tags = tag_turn(turn, transcript_tags)
-        turn_text = _turn_to_markdown(turn)
-        chunk: dict = {
-            "source": "sessions",
-            "path": os.path.relpath(summary_path, os.path.expanduser(output_dir)),
-            "doc_title": title,
-            "section_heading": f"Turn {turn.index + 1}: {turn.user_query[:80]}",
-            "start_line": 0,
-            "end_line": 0,
-            "tags": turn_tags,
-            "description": turn.user_query,
-            "text": turn_text,
-            "embedding_text": _build_turn_embedding_text(title, session_summary_text, turn, turn_text),
-            "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "full_session_path": summary_path,
-            "session_turn_count": total_turns,
-        }
-        if session_summary_text:
-            chunk["session_summary"] = session_summary_text
-        new_chunks.append(chunk)
+    session_chunk = _build_session_chunk(
+        title=title,
+        summary_path=summary_path,
+        output_dir=output_dir,
+        all_turns=all_turns,
+        transcript_tags=transcript_tags,
+        session_summary_text=session_summary_text,
+        total_turns=total_turns,
+    )
 
     new_byte_offset = byte_offset + len(new_content)
     db_mod.save_transcript_state(conn, transcript_path, {
@@ -429,7 +465,7 @@ def distill_transcript(
         "gemma_summary_text": session_summary_text,
     })
 
-    return new_chunks
+    return [session_chunk]
 
 
 def distill_all_transcripts(
