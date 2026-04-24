@@ -77,6 +77,23 @@ def test_rrf_fuse_empty_inputs(tmp_path):
     assert scores == {}
 
 
+def test_rrf_k_param_controls_rank_decay(tmp_path):
+    """Smaller rrf_k makes rank-0 hits pull away from later ranks. With the
+    legacy K=60 the top two scores were within 2%; with K=10 the gap widens
+    past 10%, giving the reranker a cleaner ordering to work with."""
+    conn = init_db(str(tmp_path / "test.db"))
+    hits = [(0, 0), (1, 1)]
+
+    tight = Searcher(conn, rrf_k=60)
+    sharp = Searcher(conn, rrf_k=10)
+    _, tight_scores = tight._rrf_fuse(hits, [], top_k=2)
+    _, sharp_scores = sharp._rrf_fuse(hits, [], top_k=2)
+
+    tight_gap = (tight_scores[0] - tight_scores[1]) / tight_scores[0]
+    sharp_gap = (sharp_scores[0] - sharp_scores[1]) / sharp_scores[0]
+    assert sharp_gap > tight_gap * 3
+
+
 # ---------------------------------------------------------------------------
 # _group_document_results
 # ---------------------------------------------------------------------------

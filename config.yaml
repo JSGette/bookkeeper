@@ -50,3 +50,8 @@ reranker:
   enabled: true
   model: BAAI/bge-reranker-base
   pool_multiplier: 6
+
+search:
+  rrf_k: 10
+  score_threshold_z: 0.8
+  min_results: 2

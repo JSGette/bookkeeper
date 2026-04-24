@@ -95,6 +95,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     search_config = config.get("search", {})
     score_threshold_z = float(search_config.get("score_threshold_z", 0.8))
     min_results = int(search_config.get("min_results", 2))
+    rrf_k = int(search_config.get("rrf_k", 10))
 
     reranker_config = config.get("reranker", {})
     reranker_enabled = bool(reranker_config.get("enabled", True))
@@ -107,6 +108,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         reranker_enabled=reranker_enabled,
         reranker_model=reranker_model,
         reranker_pool_multiplier=reranker_pool_multiplier,
+        rrf_k=rrf_k,
     )
 
     # Index queue — serialises all embed-merge-save-reload work on a single thread

@@ -20,7 +20,10 @@ from .reranker import rerank as _rerank_fn
 
 log = logging.getLogger(__name__)
 
-RRF_K = 60
+# Lower K means rank-0 hits outweigh later ranks more steeply. With the
+# cross-encoder reranker owning final precision, RRF's job is just to feed a
+# good candidate pool; a smaller K gives that pool a clearer head.
+RRF_K = 10
 _RERANK_PASSAGE_CHARS = 2000
 
 
@@ -35,6 +38,7 @@ class Searcher:
         reranker_enabled: bool = False,
         reranker_model: str = "BAAI/bge-reranker-base",
         reranker_pool_multiplier: int = 6,
+        rrf_k: int = RRF_K,
     ):
         self.conn = conn
         self._vectors: np.ndarray | None = None
@@ -45,6 +49,7 @@ class Searcher:
         self._reranker_enabled = reranker_enabled
         self._reranker_model = reranker_model
         self._reranker_pool_multiplier = max(1, reranker_pool_multiplier)
+        self._rrf_k = max(1, rrf_k)
 
     def _build_bm25(self) -> None:
         if not self._metadata:
@@ -200,10 +205,11 @@ class Searcher:
         top_k: int,
     ) -> tuple[list[int], dict[int, float]]:
         rrf_scores: dict[int, float] = {}
+        k = self._rrf_k
         for idx, rank in vector_results:
-            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + 1.0 / (RRF_K + rank)
+            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + 1.0 / (k + rank)
         for idx, rank in bm25_results:
-            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + 1.0 / (RRF_K + rank)
+            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + 1.0 / (k + rank)
 
         sorted_indices = sorted(rrf_scores, key=lambda i: rrf_scores[i], reverse=True)
         return sorted_indices[:top_k], rrf_scores
