@@ -282,6 +282,26 @@ def tag_turn(turn: Turn, transcript_tags: list[str]) -> list[str]:
     return deduped[:10]
 
 
+_SUMMARY_EMBEDDING_CAP = 400
+
+
+def _build_turn_embedding_text(
+    title: str, session_summary: str, turn: Turn, turn_text: str,
+) -> str:
+    """Compose the text fed to the embedder for a session turn chunk.
+
+    Pulls session-level context (title + gemma/authored summary) into the vector
+    so semantic queries match on session intent, not just the 3-line turn body.
+    """
+    parts = [title] if title else []
+    if session_summary:
+        parts.append(session_summary[:_SUMMARY_EMBEDDING_CAP])
+    if turn.user_query:
+        parts.append(turn.user_query)
+    parts.append(turn_text)
+    return "\n".join(parts)
+
+
 def _format_session_summary(gemma_summary: dict) -> str:
     parts: list[str] = []
     if gemma_summary.get("summary"):
@@ -339,8 +359,8 @@ def distill_transcript(
         })
         return []
 
-    for t in new_turns:
-        t.index = turns_processed + new_turns.index(t)
+    for i, t in enumerate(new_turns):
+        t.index = turns_processed + i
 
     transcript_id = p.stem
 
@@ -356,6 +376,7 @@ def distill_transcript(
     transcript_tags: list[str] = state.get("transcript_tags", [])
     session_summary_text: str = state.get("gemma_summary_text", "")
 
+    all_turns: list[Turn] | None = None
     if use_gemma and (total_turns - gemma_summary_turn) >= gemma_every_n:
         all_turns = parse_turns(content)
         for i, t in enumerate(all_turns):
@@ -370,15 +391,13 @@ def distill_transcript(
         write_summary_file(summary_path, transcript_id, title, new_turns, gemma_summary)
     else:
         write_summary_file(summary_path, transcript_id, title, new_turns, append=True)
-        if gemma_summary:
-            all_turns = parse_turns(content)
-            for i, t in enumerate(all_turns):
-                t.index = i
+        if gemma_summary and all_turns is not None:
             write_summary_file(summary_path, transcript_id, title, all_turns, gemma_summary)
 
     new_chunks = []
     for turn in new_turns:
         turn_tags = tag_turn(turn, transcript_tags)
+        turn_text = _turn_to_markdown(turn)
         chunk: dict = {
             "source": "sessions",
             "path": os.path.relpath(summary_path, os.path.expanduser(output_dir)),
@@ -388,7 +407,8 @@ def distill_transcript(
             "end_line": 0,
             "tags": turn_tags,
             "description": turn.user_query,
-            "text": _turn_to_markdown(turn),
+            "text": turn_text,
+            "embedding_text": _build_turn_embedding_text(title, session_summary_text, turn, turn_text),
             "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "full_session_path": summary_path,
             "session_turn_count": total_turns,

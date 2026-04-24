@@ -12,12 +12,10 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
-import yaml
 from fastmcp import FastMCP
 
 from . import db
-from .chunker import SourceConfig
+from .config import load_config, parse_sources, validate_config
 from .index_generator import update_index_file
 from .indexer import embed_texts, reindex_all
 from .searcher import Searcher
@@ -26,41 +24,6 @@ from .transcript import TranscriptWatcher, distill_all_transcripts
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
-
-_DEFAULT_CONFIG_PATHS = [
-    os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
-]
-
-
-def _load_config() -> dict:
-    config_path = os.environ.get("AGENTS_RAG_CONFIG")
-    search = [config_path] if config_path else _DEFAULT_CONFIG_PATHS
-    for p in search:
-        if p and Path(p).exists():
-            log.info("Loading config from %s", p)
-            return yaml.safe_load(Path(p).read_text()) or {}
-    log.warning("No config found, using defaults")
-    return {}
-
-
-def _parse_sources(config: dict) -> list[SourceConfig]:
-    sources = []
-    for s in config.get("sources", []):
-        sources.append(SourceConfig(
-            name=s["name"],
-            path=os.path.expanduser(s["path"]),
-            skip=s.get("skip", []),
-            min_lines=s.get("min_lines", 0),
-            generate_index=s.get("generate_index", False),
-            file_types=s.get("file_types", [".md"]),
-            max_chunk_tokens=s.get("max_chunk_tokens", 512),
-            max_whole_doc_tokens=s.get("max_whole_doc_tokens", 1500),
-        ))
-    return sources
 
 
 _USAGE_GUIDE = """\
@@ -94,6 +57,10 @@ code, call `deprecate_doc` with the doc path and a brief reason explaining what 
 title, what was done, key decisions, relevant files, and next steps.
 12. Previous chat sessions are automatically indexed in the background. When starting new \
 work, `query_knowledge_base` will surface prior session notes alongside documentation.
+13. When spawning subagents via the Task tool, call `get_context_block` with a query \
+relevant to the subagent's task and include the returned text in the subagent's prompt. \
+This gives subagents file paths, summaries, and session context up front.
+14. Call `status` to check server health if queries return unexpected results.
 """
 
 
@@ -108,8 +75,12 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         config_override: If provided, used instead of loading config from disk.
                          Useful for testing.
     """
-    config = config_override if config_override is not None else _load_config()
-    sources = _parse_sources(config)
+    config = config_override if config_override is not None else load_config()
+    errors = validate_config(config)
+    if errors:
+        for e in errors:
+            log.error("Config error: %s", e)
+    sources = parse_sources(config)
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
     db_path = os.path.join(cache_dir, "agents-rag.db")
     use_gemma = config.get("use_gemma", True)
@@ -127,7 +98,6 @@ def create_app(config_override: dict | None = None) -> FastMCP:
 
     conn = db.init_db(db_path)
     searcher = Searcher(conn)
-    index_lock = threading.Lock()
 
     # Index queue — serialises all embed-merge-save-reload work on a single thread
     index_q: queue.Queue[list[dict] | None] = queue.Queue()
@@ -146,68 +116,40 @@ def create_app(config_override: dict | None = None) -> FastMCP:
                 except queue.Empty:
                     break
             try:
-                with index_lock:
-                    # Deduplicate against existing chunks
-                    existing_meta, _ = db.load_all_chunks(conn)
-                    existing_keys = {
-                        (m["source"], m["path"], m.get("section_heading", ""))
-                        for m in existing_meta
-                    } if existing_meta else set()
+                existing_meta, _ = db.load_all_chunks(conn)
+                existing_keys = {
+                    (m["source"], m["path"], m.get("section_heading", ""))
+                    for m in existing_meta
+                } if existing_meta else set()
 
-                    batch = [
-                        c for c in batch
-                        if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
-                    ]
-                    if not batch:
-                        log.info("Index queue: all chunks already present, skipping")
-                        continue
+                batch = [
+                    c for c in batch
+                    if (c["source"], c["path"], c.get("section_heading", "")) not in existing_keys
+                ]
+                if not batch:
+                    log.info("Index queue: all chunks already present, skipping")
+                    continue
 
-                    texts = [c["text"] for c in batch]
-                    new_vecs = embed_texts(texts)
+                texts = [c.get("embedding_text") or c["text"] for c in batch]
+                new_vecs = embed_texts(texts)
 
-                    # Group by (source, path) and upsert
-                    by_doc: dict[tuple[str, str], list[tuple[dict, int]]] = {}
-                    for i, c in enumerate(batch):
-                        key = (c["source"], c["path"])
-                        by_doc.setdefault(key, []).append((c, i))
+                by_doc: dict[tuple[str, str], list[tuple[dict, int]]] = {}
+                for i, c in enumerate(batch):
+                    key = (c["source"], c["path"])
+                    by_doc.setdefault(key, []).append((c, i))
 
-                    for (src, path), items in by_doc.items():
-                        doc_id = db.get_document_id(conn, src, path)
-                        if doc_id is None:
-                            content = items[0][0].get("text", "")
-                            title = items[0][0].get("doc_title", "")
-                            doc_id = db.upsert_document(conn, src, path, title, "", content)
-                        chunk_metas = [c for c, _ in items]
-                        chunk_indices = [idx for _, idx in items]
-                        chunk_vecs = new_vecs[chunk_indices]
-                        # Append to existing chunks (don't delete old ones)
-                        for j, cm in enumerate(chunk_metas):
-                            vec_blob = chunk_vecs[j].astype(np.float32).tobytes()
-                            conn.execute(
-                                """INSERT INTO chunks
-                                   (doc_id, section_heading, start_line, end_line, text, tags,
-                                    description, doc_preamble, indexed_at, vector,
-                                    session_summary, full_session_path, session_turn_count)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (
-                                    doc_id,
-                                    cm.get("section_heading", ""),
-                                    cm.get("start_line", 0),
-                                    cm.get("end_line", 0),
-                                    cm.get("text", ""),
-                                    json.dumps(cm.get("tags", [])),
-                                    cm.get("description", ""),
-                                    cm.get("doc_preamble", ""),
-                                    cm.get("indexed_at", ""),
-                                    vec_blob,
-                                    cm.get("session_summary"),
-                                    cm.get("full_session_path"),
-                                    cm.get("session_turn_count"),
-                                ),
-                            )
-                        conn.commit()
+                for (src, path), items in by_doc.items():
+                    doc_id = db.get_document_id(conn, src, path)
+                    if doc_id is None:
+                        content = items[0][0].get("text", "")
+                        title = items[0][0].get("doc_title", "")
+                        doc_id = db.upsert_document(conn, src, path, title, "", content)
+                    chunk_metas = [c for c, _ in items]
+                    chunk_indices = [idx for _, idx in items]
+                    chunk_vecs = new_vecs[chunk_indices]
+                    db.append_chunks(conn, doc_id, chunk_metas, chunk_vecs)
 
-                    searcher.reload()
+                searcher.reload()
                 log.info("Index queue: flushed %d chunks", len(batch))
             except Exception:
                 log.exception("Index queue: flush failed")
@@ -275,15 +217,15 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         return result_json
 
     _reindex_status: dict = {"running": False, "last_result": None}
+    _reindex_lock = threading.Lock()
 
     def _reindex_worker(source_filter: str | None) -> None:
         t0 = time.monotonic()
         try:
-            with index_lock:
-                meta, vecs, count = reindex_all(
-                    sources, conn, use_gemma=use_gemma, source_filter=source_filter,
-                )
-                searcher.reload()
+            meta, vecs, count = reindex_all(
+                sources, conn, use_gemma=use_gemma, source_filter=source_filter,
+            )
+            searcher.reload()
 
             index_updated = False
             for src in sources:
@@ -293,18 +235,21 @@ def create_app(config_override: dict | None = None) -> FastMCP:
                         index_updated = True
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
-            _reindex_status["last_result"] = {
-                "status": "completed",
-                "chunks_indexed": count,
-                "elapsed_ms": elapsed_ms,
-                "index_updated": index_updated,
-            }
+            with _reindex_lock:
+                _reindex_status["last_result"] = {
+                    "status": "completed",
+                    "chunks_indexed": count,
+                    "elapsed_ms": elapsed_ms,
+                    "index_updated": index_updated,
+                }
             log.info("Reindex completed: %d chunks in %dms", count, elapsed_ms)
         except Exception as exc:
-            _reindex_status["last_result"] = {"status": "failed", "error": str(exc)}
+            with _reindex_lock:
+                _reindex_status["last_result"] = {"status": "failed", "error": str(exc)}
             log.exception("Reindex failed")
         finally:
-            _reindex_status["running"] = False
+            with _reindex_lock:
+                _reindex_status["running"] = False
 
     @mcp.tool
     def reindex(source: str | None = None) -> str:
@@ -315,11 +260,12 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         Args:
             source: Reindex a specific source by name, or omit to reindex all.
         """
-        if _reindex_status["running"]:
-            return json.dumps({"status": "already_running"})
+        with _reindex_lock:
+            if _reindex_status["running"]:
+                return json.dumps({"status": "already_running"})
+            _reindex_status["running"] = True
+            _reindex_status["last_result"] = None
 
-        _reindex_status["running"] = True
-        _reindex_status["last_result"] = None
         t = threading.Thread(target=_reindex_worker, args=(source,), daemon=True, name="reindex")
         t.start()
         return json.dumps({"status": "started", "source": source or "all"})
@@ -532,6 +478,103 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         """
         entries = db.get_recent_queries(conn, limit=limit)
         return json.dumps(entries, indent=2)
+
+    @mcp.tool
+    def status() -> str:
+        """Report server health: index stats, Ollama reachability, reindex state, watcher status."""
+        info: dict = {
+            "index_loaded": searcher._metadata is not None and len(searcher._metadata) > 0,
+            "chunk_count": searcher.chunk_count,
+            "source_stats": searcher.source_stats(),
+            "sources_configured": [s.name for s in sources],
+            "transcript_dirs": len(transcript_dirs),
+        }
+        with _reindex_lock:
+            info["reindex_running"] = _reindex_status["running"]
+            info["reindex_last_result"] = _reindex_status["last_result"]
+
+        try:
+            import httpx
+            from .tagger import OLLAMA_URL, OLLAMA_MODEL
+            resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+            models = [m["name"] for m in resp.json().get("models", [])]
+            info["ollama_reachable"] = True
+            info["ollama_model_loaded"] = any(OLLAMA_MODEL in m for m in models)
+            info["ollama_model"] = OLLAMA_MODEL
+        except Exception as exc:
+            info["ollama_reachable"] = False
+            info["ollama_error"] = str(exc)
+
+        return json.dumps(info, indent=2)
+
+    @mcp.tool
+    def gc(source: str | None = None) -> str:
+        """Remove index entries for files that no longer exist on disk.
+
+        Args:
+            source: Garbage-collect a specific source, or omit for all.
+        """
+        total_removed = 0
+        for src in sources:
+            if source and src.name != source:
+                continue
+            root = Path(os.path.expanduser(src.path))
+            if not root.is_dir():
+                continue
+            extensions = set(src.file_types)
+            live_paths = set()
+            for fp in root.rglob("*"):
+                if fp.is_file() and fp.suffix.lower() in extensions:
+                    live_paths.add(str(fp.relative_to(root)))
+            removed = db.gc_source(conn, src.name, live_paths)
+            total_removed += removed
+        if total_removed:
+            searcher.reload()
+        return json.dumps({"removed_documents": total_removed})
+
+    @mcp.tool
+    def get_context_block(query: str, max_tokens: int = 2000) -> str:
+        """Return a pre-formatted context block suitable for inclusion in a subagent prompt.
+
+        Unlike query_knowledge_base which returns JSON, this returns concise text
+        with file paths, summaries, and key pointers -- optimized for pasting into
+        a Task tool prompt.
+
+        Args:
+            query: Natural language query.
+            max_tokens: Approximate token budget for the block.
+        """
+        if not searcher._metadata:
+            searcher.load()
+        if not searcher._metadata:
+            return "No knowledge base index available."
+
+        results = searcher.query(
+            query, top_k=5, source=None,
+            score_threshold_z=score_threshold_z, min_results=min_results,
+        )
+        if not results:
+            return "No relevant context found."
+
+        lines = ["Context from prior work (verify against current code):"]
+        token_count = 10
+        for r in results:
+            src = r.get("source", "")
+            path = r.get("path", "")
+            summary = r.get("session_summary") or r.get("summary") or ""
+            sections = ", ".join(r.get("matched_sections", []))
+            entry = f"\n- [{src}] {path}"
+            if sections:
+                entry += f" (sections: {sections})"
+            if summary:
+                entry += f"\n  {summary[:300]}"
+            est = len(entry.split()) * 1.3
+            if token_count + est > max_tokens:
+                break
+            lines.append(entry)
+            token_count += est
+
+        return "\n".join(lines)
 
     return mcp
 
