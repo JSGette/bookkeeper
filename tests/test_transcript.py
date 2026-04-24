@@ -148,6 +148,34 @@ def test_tag_turn_max_10():
     assert len(tags) <= 10
 
 
+def test_tag_turn_does_not_extract_query_words():
+    """Per-turn query words must not become tags (BM25 corpus pollution)."""
+    turn = Turn(
+        index=0,
+        user_query="bazel migration strategy for gazelle build tags",
+        assistant_text="",
+    )
+    tags = tag_turn(turn, transcript_tags=[])
+    for word in ("bazel", "migration", "strategy", "gazelle", "build", "tags"):
+        assert word not in tags, f"query word '{word}' leaked into tags"
+
+
+def test_tag_turn_keeps_transcript_and_path_tags_only():
+    turn = Turn(
+        index=0,
+        user_query="rewrite everything in rust",
+        assistant_text="",
+        files_read=["/repo/agents_rag/searcher.py"],
+    )
+    tags = tag_turn(turn, transcript_tags=["rag", "retrieval"])
+    assert "rag" in tags
+    assert "retrieval" in tags
+    assert "searcher" in tags
+    assert "rewrite" not in tags
+    assert "everything" not in tags
+    assert "rust" not in tags
+
+
 # ---------------------------------------------------------------------------
 # distill_transcript (incremental, using DB)
 # ---------------------------------------------------------------------------

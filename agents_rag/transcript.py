@@ -262,19 +262,20 @@ def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
 # ---------------------------------------------------------------------------
 
 def tag_turn(turn: Turn, transcript_tags: list[str]) -> list[str]:
+    """Combine transcript-level tags with file-path tags for this turn.
+
+    Intentionally does NOT extract words from user_query: doing so pollutes the
+    BM25 corpus (tags are doubled in the corpus build), making every turn match
+    any query that happens to share a common word with the original user
+    question. Transcript-level gemma tags + file-path tags are enough signal.
+    """
     turn_tags: list[str] = []
     for f in turn.files_read + turn.files_edited:
         turn_tags.extend(tags_from_path(f))
-    stopwords = {"what", "does", "this", "that", "with", "from", "should", "also", "have", "been",
-                 "make", "will", "about", "into", "like", "well", "could", "would"}
-    for word in re.findall(r"[a-z][a-z0-9_-]+", turn.user_query.lower()):
-        if len(word) > 3 and word not in stopwords:
-            turn_tags.append(word)
 
-    all_tags = transcript_tags + turn_tags
     seen: set[str] = set()
     deduped: list[str] = []
-    for t in all_tags:
+    for t in transcript_tags + turn_tags:
         t = t.lower().strip()
         if t and t not in seen:
             seen.add(t)
