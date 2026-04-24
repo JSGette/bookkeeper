@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -54,9 +55,38 @@ _DOC_SUMMARY_SCHEMA = {
     "required": ["summary"],
 }
 
+# Matches "## Summary\n\n<body>" terminated by next ## heading or EOF.
+# Covers save_session, TranscriptWatcher distillation, and any authored doc
+# that ships with its own summary.
+_EXISTING_SUMMARY_RE = re.compile(
+    r"^##\s+Summary\s*\n+(.+?)(?=\n##\s+|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def extract_authored_summary(content: str) -> str:
+    """Return the body of a '## Summary' section if the doc has one, else ''."""
+    m = _EXISTING_SUMMARY_RE.search(content)
+    if not m:
+        return ""
+    body = m.group(1).strip()
+    # Reject section markers left in place by empty Summary bodies.
+    if not body or body.startswith("##"):
+        return ""
+    return body[:500]
+
 
 def summarize_document(content: str, title: str = "", use_gemma: bool = True) -> str:
-    """Produce a 2-3 sentence document summary. Falls back to first paragraph."""
+    """Produce a 2-3 sentence document summary.
+
+    Priority: authored ## Summary section > gemma > first-paragraph fallback.
+    Authored summaries (e.g. save_session output, transcript distillation) are
+    trusted and passed through verbatim — gemma adds no value and loses fidelity.
+    """
+    authored = extract_authored_summary(content)
+    if authored:
+        return authored
+
     if not use_gemma:
         return description_from_content(content)
 
