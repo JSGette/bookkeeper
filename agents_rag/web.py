@@ -10,25 +10,11 @@ from collections import Counter
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
-import yaml
-
 from . import db
+from .config import load_config
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
-
-_DEFAULT_CONFIG_PATHS = [
-    os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
-]
-
-
-def _load_config() -> dict:
-    config_path = os.environ.get("AGENTS_RAG_CONFIG")
-    search = [config_path] if config_path else _DEFAULT_CONFIG_PATHS
-    for p in search:
-        if p and Path(p).exists():
-            return yaml.safe_load(Path(p).read_text()) or {}
-    return {}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -123,7 +109,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("AGENTS_RAG_WEB_PORT", "8808")))
     args = parser.parse_args()
 
-    config = _load_config()
+    config = load_config()
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
     Handler.db_path = os.path.join(cache_dir, "agents-rag.db")
 

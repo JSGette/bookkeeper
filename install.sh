@@ -6,6 +6,16 @@ MCP_JSON="$HOME/.cursor/mcp.json"
 RULES_DIR="$HOME/.cursor/rules"
 RULE_FILE="$RULES_DIR/agents-rag.md"
 
+# Kill any existing agents-rag server processes to avoid SQLite lock contention
+existing_pids=$(pgrep -f 'agents_rag\.server' || true)
+if [ -n "$existing_pids" ]; then
+    echo "==> Killing existing agents-rag server processes: $existing_pids"
+    echo "$existing_pids" | xargs kill 2>/dev/null || true
+    sleep 1
+    # Force-kill anything that didn't exit cleanly
+    echo "$existing_pids" | xargs kill -9 2>/dev/null || true
+fi
+
 echo "==> Installing agents-rag from $SCRIPT_DIR"
 pip install -e "$SCRIPT_DIR"
 

@@ -50,6 +50,18 @@ def test_rerank_catches_predict_failure():
         assert reranker.rerank("q", ["p"]) is None
 
 
+def test_warm_returns_true_when_model_loads():
+    fake_model = MagicMock()
+    with patch.object(reranker, "_get_reranker", return_value=fake_model) as mock_get:
+        assert reranker.warm("any-model") is True
+    mock_get.assert_called_once_with("any-model")
+
+
+def test_warm_returns_false_when_model_load_fails():
+    with patch.object(reranker, "_get_reranker", return_value=None):
+        assert reranker.warm("any-model") is False
+
+
 def test_get_reranker_caches_on_failure():
     """Once load fails, subsequent calls short-circuit without retrying."""
     call_count = {"n": 0}

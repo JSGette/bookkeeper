@@ -75,6 +75,15 @@ def rerank(
         return None
 
 
+def warm(model_name: str = "BAAI/bge-reranker-base") -> bool:
+    """Force-load the reranker model. Safe to call from a startup thread.
+
+    Returns True if the model is ready (or already was), False if loading failed.
+    A no-op when called repeatedly with the same model.
+    """
+    return _get_reranker(model_name) is not None
+
+
 def reset_for_testing() -> None:
     """Clear singleton state. Test-only helper."""
     global _model, _model_name_loaded, _model_load_failed

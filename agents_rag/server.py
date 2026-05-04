@@ -14,7 +14,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from . import db
+from . import db, reranker
 from .config import load_config, parse_sources, validate_config
 from .index_generator import update_index_file
 from .indexer import embed_texts, reindex_all
@@ -110,6 +110,14 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         reranker_pool_multiplier=reranker_pool_multiplier,
         rrf_k=rrf_k,
     )
+
+    # Warm the cross-encoder in the background so the first user query doesn't
+    # eat the ~60s cold-start latency we observed in the audit log.
+    if reranker_enabled:
+        threading.Thread(
+            target=reranker.warm, args=(reranker_model,),
+            daemon=True, name="reranker-warmup",
+        ).start()
 
     # Index queue — serialises all embed-merge-save-reload work on a single thread
     index_q: queue.Queue[list[dict] | None] = queue.Queue()
@@ -232,7 +240,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             return json.dumps({"error": "Index is empty. Run reindex first."})
 
         t0 = time.monotonic()
-        results = searcher.query(
+        results, query_meta = searcher.query_with_meta(
             query, top_k=max_results, source=source,
             score_threshold_z=score_threshold_z, min_results=min_results,
         )
@@ -240,7 +248,12 @@ def create_app(config_override: dict | None = None) -> FastMCP:
 
         result_json = json.dumps(results, indent=2)
         try:
-            db.log_query(conn, query, source, max_results, len(results), result_json, latency_ms)
+            db.log_query(
+                conn, query, source, max_results, len(results), result_json, latency_ms,
+                reranker_used=query_meta["reranker_used"],
+                rrf_k=query_meta["rrf_k"],
+                score_kind=query_meta["score_kind"],
+            )
         except Exception:
             log.warning("Failed to log query to audit table", exc_info=True)
 

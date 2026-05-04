@@ -269,9 +269,10 @@ def test_rerank_pool_disabled_by_default(mock_embed, tmp_path):
     searcher.load()
     indices = [0, 1]
     scores = {0: 0.01, 1: 0.02}
-    out_indices, out_scores = searcher._rerank_pool("query", indices, scores)
+    out_indices, out_scores, did_rerank = searcher._rerank_pool("query", indices, scores)
     assert out_indices == indices
     assert out_scores == scores
+    assert did_rerank is False
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
@@ -299,11 +300,12 @@ def test_rerank_pool_reorders_and_replaces_scores(mock_embed, tmp_path):
         return np.array([0.1, 0.5, 0.9], dtype=np.float32)
 
     with patch("agents_rag.searcher._rerank_fn", side_effect=fake_rerank):
-        out_indices, out_scores = searcher._rerank_pool("query", rrf_indices, rrf_scores)
+        out_indices, out_scores, did_rerank = searcher._rerank_pool("query", rrf_indices, rrf_scores)
 
     assert out_indices == [2, 1, 0]
     assert out_scores[2] == pytest.approx(0.9)
     assert out_scores[0] == pytest.approx(0.1)
+    assert did_rerank is True
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
@@ -320,10 +322,11 @@ def test_rerank_pool_falls_back_when_reranker_returns_none(mock_embed, tmp_path)
     rrf_scores = {0: 0.03, 1: 0.02}
 
     with patch("agents_rag.searcher._rerank_fn", return_value=None):
-        out_indices, out_scores = searcher._rerank_pool("q", rrf_indices, rrf_scores)
+        out_indices, out_scores, did_rerank = searcher._rerank_pool("q", rrf_indices, rrf_scores)
 
     assert out_indices == rrf_indices
     assert out_scores == rrf_scores
+    assert did_rerank is False
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
@@ -354,6 +357,68 @@ def test_query_with_reranker_uses_reranked_scores(mock_embed, tmp_path):
     assert results[0]["path"] == "b.md"
     # Score came from reranker (not RRF 1/(60+rank) range).
     assert results[0]["score"] > 0.5
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_query_with_meta_reports_rerank_path(mock_embed, tmp_path):
+    conn = init_db(str(tmp_path / "test.db"))
+    _insert_doc_chunks(conn, [
+        ("a.md", "A", [("S1", "alpha beta")]),
+        ("b.md", "B", [("S2", "beta gamma")]),
+        ("c.md", "C", [("S3", "gamma delta")]),
+    ])
+    searcher = Searcher(conn, reranker_enabled=True, reranker_pool_multiplier=6, rrf_k=10)
+    searcher.load()
+
+    def fake_rerank(query, passages, model_name):
+        return np.array([0.1, 0.5, 0.9], dtype=np.float32)[:len(passages)]
+
+    with patch("agents_rag.searcher._rerank_fn", side_effect=fake_rerank):
+        results, meta = searcher.query_with_meta("anything", top_k=3)
+
+    assert results
+    assert meta == {"reranker_used": True, "rrf_k": 10, "score_kind": "rerank"}
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_query_with_meta_reports_rrf_when_reranker_off(mock_embed, tmp_path):
+    conn = init_db(str(tmp_path / "test.db"))
+    _insert_doc_chunks(conn, [
+        ("a.md", "A", [("S1", "alpha beta")]),
+        ("b.md", "B", [("S2", "beta gamma")]),
+    ])
+    searcher = Searcher(conn, reranker_enabled=False, rrf_k=42)
+    searcher.load()
+
+    _, meta = searcher.query_with_meta("anything", top_k=2)
+    assert meta == {"reranker_used": False, "rrf_k": 42, "score_kind": "rrf"}
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_query_with_meta_reports_rrf_when_reranker_falls_back(mock_embed, tmp_path):
+    """If the cross-encoder fails, we must record the row as 'rrf', not 'rerank'."""
+    conn = init_db(str(tmp_path / "test.db"))
+    _insert_doc_chunks(conn, [
+        ("a.md", "A", [("S1", "alpha beta")]),
+        ("b.md", "B", [("S2", "beta gamma")]),
+    ])
+    searcher = Searcher(conn, reranker_enabled=True, rrf_k=10)
+    searcher.load()
+
+    with patch("agents_rag.searcher._rerank_fn", return_value=None):
+        _, meta = searcher.query_with_meta("anything", top_k=2)
+
+    assert meta["reranker_used"] is False
+    assert meta["score_kind"] == "rrf"
+
+
+def test_query_with_meta_empty_index(tmp_path):
+    conn = init_db(str(tmp_path / "test.db"))
+    searcher = Searcher(conn, rrf_k=10)
+    searcher.load()
+    results, meta = searcher.query_with_meta("anything")
+    assert results == []
+    assert meta == {"reranker_used": False, "rrf_k": 10, "score_kind": "rrf"}
 
 
 def test_passage_for_rerank_composes_title_heading_text(tmp_path):

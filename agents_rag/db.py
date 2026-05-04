@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+_write_lock = threading.Lock()
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS documents (
@@ -74,7 +77,10 @@ CREATE TABLE IF NOT EXISTS query_log (
     top_k INTEGER NOT NULL,
     result_count INTEGER NOT NULL,
     results_json TEXT NOT NULL,
-    latency_ms INTEGER NOT NULL
+    latency_ms INTEGER NOT NULL,
+    reranker_used INTEGER NOT NULL DEFAULT 0,
+    rrf_k INTEGER NOT NULL DEFAULT 0,
+    score_kind TEXT NOT NULL DEFAULT 'rrf'
 );
 """
 
@@ -88,20 +94,31 @@ def init_db(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(_SCHEMA)
-    _migrate(conn)
-    conn.commit()
+    with _write_lock:
+        for stmt in _SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                conn.execute(stmt)
+        _migrate(conn)
+        conn.commit()
     return conn
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Add columns/tables introduced after initial schema."""
+    """Add columns/tables introduced after initial schema. Caller holds _write_lock."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
     if "summary" not in cols:
         conn.execute("ALTER TABLE documents ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         log.info("Migrated: added documents.summary column")
+
+    qlog_cols = {r[1] for r in conn.execute("PRAGMA table_info(query_log)").fetchall()}
+    if qlog_cols and "reranker_used" not in qlog_cols:
+        conn.execute("ALTER TABLE query_log ADD COLUMN reranker_used INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE query_log ADD COLUMN rrf_k INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE query_log ADD COLUMN score_kind TEXT NOT NULL DEFAULT 'rrf'")
+        log.info("Migrated: added query_log.reranker_used / rrf_k / score_kind columns")
 
 
 # ---------------------------------------------------------------------------
@@ -117,22 +134,23 @@ def upsert_document(
     content: str,
     summary: str = "",
 ) -> int:
-    conn.execute(
-        """INSERT INTO documents (source, path, title, preamble, content, summary, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(source, path) DO UPDATE SET
-               title=excluded.title,
-               preamble=excluded.preamble,
-               content=excluded.content,
-               summary=excluded.summary,
-               indexed_at=excluded.indexed_at""",
-        (source, path, title, preamble, content, summary, _now()),
-    )
-    conn.commit()
-    row = conn.execute(
-        "SELECT id FROM documents WHERE source=? AND path=?", (source, path),
-    ).fetchone()
-    return row[0]
+    with _write_lock:
+        conn.execute(
+            """INSERT INTO documents (source, path, title, preamble, content, summary, indexed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(source, path) DO UPDATE SET
+                   title=excluded.title,
+                   preamble=excluded.preamble,
+                   content=excluded.content,
+                   summary=excluded.summary,
+                   indexed_at=excluded.indexed_at""",
+            (source, path, title, preamble, content, summary, _now()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id FROM documents WHERE source=? AND path=?", (source, path),
+        ).fetchone()
+        return row[0]
 
 
 def get_document_id(conn: sqlite3.Connection, source: str, path: str) -> int | None:
@@ -158,8 +176,9 @@ def get_document_summary(conn: sqlite3.Connection, source: str, path: str) -> st
 
 def delete_source_documents(conn: sqlite3.Connection, source: str) -> None:
     """Delete all documents (and cascading chunks) for a source."""
-    conn.execute("DELETE FROM documents WHERE source=?", (source,))
-    conn.commit()
+    with _write_lock:
+        conn.execute("DELETE FROM documents WHERE source=?", (source,))
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -173,32 +192,68 @@ def upsert_chunks(
     vectors: np.ndarray,
 ) -> None:
     """Replace all chunks for a document with new ones."""
-    conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
-    for i, chunk in enumerate(chunks):
-        vec_blob = vectors[i].astype(np.float32).tobytes()
-        conn.execute(
-            """INSERT INTO chunks
-               (doc_id, section_heading, start_line, end_line, text, tags,
-                description, doc_preamble, indexed_at, vector,
-                session_summary, full_session_path, session_turn_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                doc_id,
-                chunk.get("section_heading", ""),
-                chunk.get("start_line", 0),
-                chunk.get("end_line", 0),
-                chunk.get("text", ""),
-                json.dumps(chunk.get("tags", [])),
-                chunk.get("description", ""),
-                chunk.get("doc_preamble", ""),
-                chunk.get("indexed_at", _now()),
-                vec_blob,
-                chunk.get("session_summary"),
-                chunk.get("full_session_path"),
-                chunk.get("session_turn_count"),
-            ),
-        )
-    conn.commit()
+    with _write_lock:
+        conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+        for i, chunk in enumerate(chunks):
+            vec_blob = vectors[i].astype(np.float32).tobytes()
+            conn.execute(
+                """INSERT INTO chunks
+                   (doc_id, section_heading, start_line, end_line, text, tags,
+                    description, doc_preamble, indexed_at, vector,
+                    session_summary, full_session_path, session_turn_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    doc_id,
+                    chunk.get("section_heading", ""),
+                    chunk.get("start_line", 0),
+                    chunk.get("end_line", 0),
+                    chunk.get("text", ""),
+                    json.dumps(chunk.get("tags", [])),
+                    chunk.get("description", ""),
+                    chunk.get("doc_preamble", ""),
+                    chunk.get("indexed_at", _now()),
+                    vec_blob,
+                    chunk.get("session_summary"),
+                    chunk.get("full_session_path"),
+                    chunk.get("session_turn_count"),
+                ),
+            )
+        conn.commit()
+
+
+def append_chunks(
+    conn: sqlite3.Connection,
+    doc_id: int,
+    chunks: list[dict],
+    vectors: np.ndarray,
+) -> None:
+    """Append chunks to a document without deleting existing ones."""
+    with _write_lock:
+        for i, chunk in enumerate(chunks):
+            vec_blob = vectors[i].astype(np.float32).tobytes()
+            conn.execute(
+                """INSERT INTO chunks
+                   (doc_id, section_heading, start_line, end_line, text, tags,
+                    description, doc_preamble, indexed_at, vector,
+                    session_summary, full_session_path, session_turn_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    doc_id,
+                    chunk.get("section_heading", ""),
+                    chunk.get("start_line", 0),
+                    chunk.get("end_line", 0),
+                    chunk.get("text", ""),
+                    json.dumps(chunk.get("tags", [])),
+                    chunk.get("description", ""),
+                    chunk.get("doc_preamble", ""),
+                    chunk.get("indexed_at", _now()),
+                    vec_blob,
+                    chunk.get("session_summary"),
+                    chunk.get("full_session_path"),
+                    chunk.get("session_turn_count"),
+                ),
+            )
+        conn.commit()
 
 
 def load_all_chunks(
@@ -277,16 +332,17 @@ def load_hnsw_cache(conn: sqlite3.Connection) -> tuple[bytes, int] | None:
 
 
 def save_hnsw_cache(conn: sqlite3.Connection, data: bytes, num_chunks: int) -> None:
-    conn.execute(
-        """INSERT INTO hnsw_cache (id, data, chunk_count, updated_at)
-           VALUES (1, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-               data=excluded.data,
-               chunk_count=excluded.chunk_count,
-               updated_at=excluded.updated_at""",
-        (data, num_chunks, _now()),
-    )
-    conn.commit()
+    with _write_lock:
+        conn.execute(
+            """INSERT INTO hnsw_cache (id, data, chunk_count, updated_at)
+               VALUES (1, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   data=excluded.data,
+                   chunk_count=excluded.chunk_count,
+                   updated_at=excluded.updated_at""",
+            (data, num_chunks, _now()),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -314,21 +370,22 @@ def load_source_state(conn: sqlite3.Connection, source_name: str) -> dict:
 
 
 def save_source_state(conn: sqlite3.Connection, source_name: str, state: dict) -> None:
-    conn.execute(
-        """INSERT INTO source_state (source_name, commit_hash, mtimes, indexed_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(source_name) DO UPDATE SET
-               commit_hash=excluded.commit_hash,
-               mtimes=excluded.mtimes,
-               indexed_at=excluded.indexed_at""",
-        (
-            source_name,
-            state.get("commit_hash"),
-            json.dumps(state.get("mtimes", {})),
-            state.get("indexed_at", _now()),
-        ),
-    )
-    conn.commit()
+    with _write_lock:
+        conn.execute(
+            """INSERT INTO source_state (source_name, commit_hash, mtimes, indexed_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(source_name) DO UPDATE SET
+                   commit_hash=excluded.commit_hash,
+                   mtimes=excluded.mtimes,
+                   indexed_at=excluded.indexed_at""",
+            (
+                source_name,
+                state.get("commit_hash"),
+                json.dumps(state.get("mtimes", {})),
+                state.get("indexed_at", _now()),
+            ),
+        )
+        conn.commit()
 
 
 def load_all_source_state(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -360,18 +417,20 @@ def load_deprecated(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def save_deprecated(conn: sqlite3.Connection, path: str, reason: str) -> None:
-    conn.execute(
-        """INSERT INTO deprecated (path, reason) VALUES (?, ?)
-           ON CONFLICT(path) DO UPDATE SET reason=excluded.reason""",
-        (path, reason),
-    )
-    conn.commit()
+    with _write_lock:
+        conn.execute(
+            """INSERT INTO deprecated (path, reason) VALUES (?, ?)
+               ON CONFLICT(path) DO UPDATE SET reason=excluded.reason""",
+            (path, reason),
+        )
+        conn.commit()
 
 
 def remove_deprecated(conn: sqlite3.Connection, path: str) -> bool:
-    cur = conn.execute("DELETE FROM deprecated WHERE path=?", (path,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_lock:
+        cur = conn.execute("DELETE FROM deprecated WHERE path=?", (path,))
+        conn.commit()
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +454,14 @@ def load_transcript_state(conn: sqlite3.Connection, transcript_path: str) -> dic
 def save_transcript_state(conn: sqlite3.Connection, transcript_path: str, state: dict) -> None:
     import hashlib
     h = hashlib.sha256(transcript_path.encode()).hexdigest()[:16]
-    conn.execute(
-        """INSERT INTO transcript_state (transcript_hash, state_json)
-           VALUES (?, ?)
-           ON CONFLICT(transcript_hash) DO UPDATE SET state_json=excluded.state_json""",
-        (h, json.dumps(state)),
-    )
-    conn.commit()
+    with _write_lock:
+        conn.execute(
+            """INSERT INTO transcript_state (transcript_hash, state_json)
+               VALUES (?, ?)
+               ON CONFLICT(transcript_hash) DO UPDATE SET state_json=excluded.state_json""",
+            (h, json.dumps(state)),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -416,20 +476,27 @@ def log_query(
     result_count: int,
     results_json: str,
     latency_ms: int,
+    reranker_used: bool = False,
+    rrf_k: int = 0,
+    score_kind: str = "rrf",
 ) -> None:
-    conn.execute(
-        """INSERT INTO query_log (timestamp, query, source_filter, top_k,
-                                  result_count, results_json, latency_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (_now(), query, source_filter, top_k, result_count, results_json, latency_ms),
-    )
-    conn.commit()
+    with _write_lock:
+        conn.execute(
+            """INSERT INTO query_log (timestamp, query, source_filter, top_k,
+                                      result_count, results_json, latency_ms,
+                                      reranker_used, rrf_k, score_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (_now(), query, source_filter, top_k, result_count, results_json, latency_ms,
+             1 if reranker_used else 0, rrf_k, score_kind),
+        )
+        conn.commit()
 
 
 def get_recent_queries(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     rows = conn.execute(
         """SELECT id, timestamp, query, source_filter, top_k,
-                  result_count, results_json, latency_ms
+                  result_count, results_json, latency_ms,
+                  reranker_used, rrf_k, score_kind
            FROM query_log ORDER BY id DESC LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -438,9 +505,32 @@ def get_recent_queries(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
             "id": r[0], "timestamp": r[1], "query": r[2],
             "source_filter": r[3], "top_k": r[4], "result_count": r[5],
             "results_json": r[6], "latency_ms": r[7],
+            "reranker_used": bool(r[8]), "rrf_k": r[9], "score_kind": r[10],
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Garbage collection
+# ---------------------------------------------------------------------------
+
+def gc_source(conn: sqlite3.Connection, source: str, live_paths: set[str]) -> int:
+    """Delete documents (and cascading chunks) for paths no longer on disk.
+
+    Returns number of documents removed.
+    """
+    rows = conn.execute(
+        "SELECT id, path FROM documents WHERE source=?", (source,),
+    ).fetchall()
+    stale_ids = [doc_id for doc_id, path in rows if path not in live_paths]
+    if not stale_ids:
+        return 0
+    with _write_lock:
+        placeholders = ",".join("?" * len(stale_ids))
+        conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", stale_ids)
+        conn.commit()
+    return len(stale_ids)
 
 
 # ---------------------------------------------------------------------------

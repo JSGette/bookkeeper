@@ -228,19 +228,24 @@ class Searcher:
         query_text: str,
         fused_indices: list[int],
         rrf_scores: dict[int, float],
-    ) -> tuple[list[int], dict[int, float]]:
-        """Rescore fused candidates with the cross-encoder. Falls back to RRF on failure."""
+    ) -> tuple[list[int], dict[int, float], bool]:
+        """Rescore fused candidates with the cross-encoder. Falls back to RRF on failure.
+
+        The trailing bool tells callers whether the cross-encoder actually ran —
+        needed so audit logs can distinguish reranker-scored rows from silent
+        RRF fallbacks that happen to land in the same numeric range.
+        """
         if not self._reranker_enabled or len(fused_indices) <= 1 or self._metadata is None:
-            return fused_indices, rrf_scores
+            return fused_indices, rrf_scores, False
 
         passages = [self._passage_for_rerank(i) for i in fused_indices]
         scores = _rerank_fn(query_text, passages, model_name=self._reranker_model)
         if scores is None or len(scores) != len(fused_indices):
-            return fused_indices, rrf_scores
+            return fused_indices, rrf_scores, False
 
         new_scores = {idx: float(scores[i]) for i, idx in enumerate(fused_indices)}
         ordered = sorted(fused_indices, key=lambda i: new_scores[i], reverse=True)
-        return ordered, new_scores
+        return ordered, new_scores, True
 
     def query(
         self,
@@ -250,8 +255,30 @@ class Searcher:
         score_threshold_z: float = 0.8,
         min_results: int = 2,
     ) -> list[dict]:
+        results, _meta = self.query_with_meta(
+            query_text,
+            top_k=top_k,
+            source=source,
+            score_threshold_z=score_threshold_z,
+            min_results=min_results,
+        )
+        return results
+
+    def query_with_meta(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        source: str | None = None,
+        score_threshold_z: float = 0.8,
+        min_results: int = 2,
+    ) -> tuple[list[dict], dict]:
+        """Same as query() but also returns scoring-path metadata for auditing.
+
+        meta keys: reranker_used (bool), rrf_k (int), score_kind ("rerank"|"rrf").
+        """
+        query_meta = {"reranker_used": False, "rrf_k": self._rrf_k, "score_kind": "rrf"}
         if self._vectors is None or self._metadata is None or len(self._metadata) == 0:
-            return []
+            return [], query_meta
 
         rerank_pool = top_k * self._reranker_pool_multiplier if self._reranker_enabled else top_k
         candidate_n = max(top_k * 3, rerank_pool)
@@ -259,7 +286,10 @@ class Searcher:
         bm25_results = self._bm25_search(query_text, candidate_n, source)
         fused_indices, scores = self._rrf_fuse(vector_results, bm25_results, rerank_pool)
 
-        fused_indices, scores = self._rerank_pool(query_text, fused_indices, scores)
+        fused_indices, scores, did_rerank = self._rerank_pool(query_text, fused_indices, scores)
+        if did_rerank:
+            query_meta["reranker_used"] = True
+            query_meta["score_kind"] = "rerank"
         fused_indices = fused_indices[:top_k]
 
         # Freshness boost — scaled so it's a tiebreaker regardless of score origin.
@@ -361,7 +391,7 @@ class Searcher:
             results.append(group)
         results.sort(key=lambda r: r.get("score", 0), reverse=True)
 
-        return results
+        return results, query_meta
 
     def _group_document_results(self, results: list[dict]) -> list[dict]:
         """Merge multiple results from the same file into one result with combined sections."""
