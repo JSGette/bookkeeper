@@ -30,37 +30,62 @@ _USAGE_GUIDE = """\
 # agents-rag Usage Guide
 
 Query results are prior notes and hypotheses, not ground truth — they may be outdated.
-Results contain **summaries**, not raw text. Follow this protocol:
 
-1. Call `query_knowledge_base` with a short natural-language query describing the task.
-2. Use `source` to filter by source name, or omit to search all sources.
-3. Prefer recently indexed docs — check `indexed_at`; older docs are more likely stale.
-4. **Document results** contain a `summary` field (a 2-3 sentence document-level overview) \
-and a `matched_sections` list showing which sections triggered the match. Use the summary \
-to decide relevance.
-5. **Session results** contain a `session_summary` field (distilled overview with decisions \
-and next steps). Multiple matching turns from the same session are collapsed into one \
-result; `matched_turns` shows which turns matched.
-6. If the summary is sufficient for your task, use it directly. If you need exact code, \
-specific details, or full context, call `get_full_document` with the `path` and `source` \
-fields from the result. Use `matched_sections` to know which part of the document to \
-focus on.
-7. If a result references source files, configs, or code paths, read those sources too — \
-the doc is a pointer, the code is the truth.
-8. If a result makes a factual claim about the codebase (e.g., "X blocks Y"), verify it \
-against the current source code before repeating it.
-9. If a result has `"deprecated": true`, do not use it as actionable context — treat it \
-purely as historical background.
-10. If during verification (step 8) a doc's claims are contradicted by the current source \
-code, call `deprecate_doc` with the doc path and a brief reason explaining what changed.
-11. At the end of a meaningful work session, call `save_session` with a structured summary: \
-title, what was done, key decisions, relevant files, and next steps.
-12. Previous chat sessions are automatically indexed in the background. When starting new \
-work, `query_knowledge_base` will surface prior session notes alongside documentation.
-13. When spawning subagents via the Task tool, call `get_context_block` with a query \
-relevant to the subagent's task and include the returned text in the subagent's prompt. \
-This gives subagents file paths, summaries, and session context up front.
-14. Call `status` to check server health if queries return unexpected results.
+## Workflow
+
+1. Call `query_knowledge_base` with a short natural-language query. Use `source` \
+to filter by source name, or omit for all sources. Prefer recent `indexed_at` — \
+older docs are more likely stale.
+2. **Triage by summary only.** Read the `summary` (document results) or \
+`session_summary` (session results) just to decide which hits are relevant to \
+your task. Do not paraphrase, quote, or act on a result based on its summary alone.
+3. **Fetch the full document** for every result you intend to use beyond the \
+relevance gate. Call `get_full_document` with the result's `path` and `source`. \
+Then jump to `matched_sections` (and `start_line`/`end_line` for document hits) \
+first.
+4. **Verify against current code.** If a result references source files, configs, \
+or code paths, read those sources too. The doc is a pointer; the code is the truth.
+5. **Save context at the end.** When the work session is meaningful (implementation, \
+investigation, debugging), call `save_session` with title, summary, decisions, \
+relevant_files, next_steps so the next chat can resume without re-discovering context.
+
+## When the summary alone is enough
+
+- Deciding "is this hit relevant to my task?" (the relevance gate in step 2).
+- Picking which file paths to read directly with the Read tool.
+
+That's it. Anything past relevance triage requires `get_full_document`.
+
+## When you MUST call `get_full_document`
+
+- Citing a specific fact, function name, config value, line number, PR/Jira ID, \
+or decision rationale to the user.
+- Summarising prior decisions or next steps from a session result. \
+`session_summary` is more self-contained than a doc `summary`, but it is still \
+a distillation — fetch the full session before treating its bullets as authoritative.
+- Continuing work described in a session (you need the complete \
+Decisions / Next Steps / Relevant Files lists, not the 2-3 sentence summary).
+- Whenever you are about to write or modify code based on a retrieved doc.
+- Whenever the user asks "what did we decide about X" or "where did we leave Y".
+
+## Invariants
+
+- Results with `"deprecated": true` are historical context only. Do not treat \
+their claims as current facts; mention them only if the user is asking about \
+past decisions or evolution of the codebase.
+- If during verification you find a doc's claim contradicted by current code, \
+call `deprecate_doc` with the doc path and a brief reason explaining what changed. \
+This keeps the knowledge base accurate for future queries.
+- Previous chat sessions are auto-indexed in the background and surface alongside \
+documentation. Treat them with the same rules as docs.
+
+## Notes
+
+- For subagents launched via the Task tool, call `get_context_block` with a query \
+relevant to the subagent's task and paste the returned text into the subagent's \
+prompt under "Prior context from knowledge base:". This keeps the subagent from \
+re-searching blindly.
+- Call `status` if `query_knowledge_base` returns unexpected results or errors.
 """
 
 
@@ -225,9 +250,12 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     def query_knowledge_base(query: str, max_results: int = 5, source: str | None = None) -> str:
         """Search the knowledge base for documentation relevant to a query.
 
-        Results contain document-level summaries, not raw text. Call
-        `get_full_document` with the result's `path` and `source` to read
-        the complete content when the summary isn't enough.
+        Results contain document-level summaries, not raw text. Treat the
+        `summary` / `session_summary` as a relevance hint only — call
+        `get_full_document` with the result's `path` and `source` before
+        quoting facts, naming functions, citing decisions, continuing prior
+        work, or writing code based on a result. See the
+        `agents-rag://usage-guide` resource for the full protocol.
 
         Args:
             query: Natural language query describing what you're looking for.

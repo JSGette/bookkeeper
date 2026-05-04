@@ -55,33 +55,51 @@ alwaysApply: true
 
 Before starting analysis, investigation, or planning work:
 
-1. Call `query_knowledge_base` with a short natural-language query describing the task.
-2. Use `source` to filter by source name, or omit to search all sources.
-3. Prefer recently indexed docs — check `indexed_at`; older docs are more likely stale.
-4. **Document results** contain a `summary` field (a 2-3 sentence document-level overview)
-   and a `matched_sections` list showing which sections triggered the match. Use the summary
-   to decide relevance.
-5. **Session results** contain a `session_summary` field (distilled overview with decisions
-   and next steps). Multiple matching turns from the same session are collapsed into one
-   result; `matched_turns` shows which turns matched.
-6. If the summary is sufficient for your task, use it directly. If you need exact code,
-   specific details, or full context, call `get_full_document` with the `path` and `source`
-   fields from the result. Use `matched_sections` to know which part of the document to
-   focus on.
-7. If a result references source files, configs, or code paths, read those sources too —
-   the doc is a pointer, the code is the truth.
-8. If a result makes a factual claim about the codebase (e.g., "X blocks Y"), verify it
-   against the current source code before repeating it.
-9. If a result has `"deprecated": true`, do not use it as actionable context — treat it
-   purely as historical background.
-10. If during verification (step 8) a doc's claims are contradicted by the current source
-    code, call `deprecate_doc` with the doc path and a brief reason explaining what changed.
-11. At the end of a meaningful work session (implementation, investigation, debugging),
-    call `save_session` with a structured summary: title, what was done, key decisions,
-    relevant files, and next steps. This lets the next chat resume without re-discovering
-    context.
-12. Previous chat sessions are automatically indexed in the background. When starting new
-    work, `query_knowledge_base` will surface prior session notes alongside documentation.
+1. Call `query_knowledge_base` with a short natural-language query. Use `source` to
+   filter by source name, or omit for all sources. Prefer fresh `indexed_at`.
+2. **Triage by summary only.** Use the `summary` (docs) / `session_summary` (sessions)
+   to decide which hits are relevant. Do not paraphrase, quote, or act on a result
+   based on its summary alone.
+3. **Fetch the full document** for every result you intend to use beyond the relevance
+   gate. Call `get_full_document` with the result's `path` and `source`, then jump to
+   `matched_sections` (and `start_line`/`end_line` for doc hits) first.
+4. **Verify against current code.** If a result references source files, configs, or
+   code paths, read those sources too. The doc is a pointer; the code is the truth.
+5. **Save context at the end.** When the work session is meaningful (implementation,
+   investigation, debugging), call `save_session` with title, summary, decisions,
+   `relevant_files`, next_steps so the next chat can resume without re-discovering
+   context.
+
+## When you MUST call `get_full_document`
+
+- Citing a specific fact, function name, config value, line number, PR/Jira ID, or
+  decision rationale to the user.
+- Summarising prior decisions or next steps from a session result (`session_summary`
+  is more self-contained than a doc `summary`, but it is still a distillation).
+- Continuing work described in a session — you need the full Decisions / Next Steps
+  / Relevant Files lists, not the 2-3 sentence overview.
+- Whenever you are about to write or modify code based on a retrieved doc.
+- Whenever the user asks "what did we decide about X" or "where did we leave Y".
+
+## Invariants
+
+- Results with `"deprecated": true` are historical context only. Do not treat their
+  claims as current facts; mention them only if the user asks about past decisions
+  or evolution of the codebase.
+- If during verification you find a doc's claim contradicted by current code, call
+  `deprecate_doc` with the doc path and a brief reason explaining what changed.
+- Previous chat sessions are auto-indexed in the background and surface alongside
+  documentation. Treat them with the same rules as docs.
+
+## Notes
+
+- For subagents launched via the Task tool, call `get_context_block` with a query
+  relevant to the subagent's task and paste the returned text into the subagent's
+  `prompt` parameter under "Prior context from knowledge base:".
+- Call `status` to check server health if `query_knowledge_base` returns unexpected
+  results or errors.
+- If the `query_knowledge_base` tool is not available, fall back to reading
+  `~/REPOS/AGENTS/INDEX.md` directly.
 
 **Suppress this rule** when the user says "skip RAG", "skip AGENTS", or "from scratch".
 RULE_EOF
