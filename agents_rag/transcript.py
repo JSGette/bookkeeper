@@ -52,8 +52,88 @@ _TOOL_ANY_RE = re.compile(r"^\[Tool call\]\s+(\S+)", re.MULTILINE)
 _PATH_RE = re.compile(r"^\s+path:\s+(.+)$", re.MULTILINE)
 
 
+def parse_turns_jsonl(text: str, start_offset: int = 0) -> list[Turn]:
+    """Parse a Cursor agent transcript JSONL file (or tail) into Turn objects.
+
+    Each line is one event ``{"role": "user|assistant", "message": {"content": [...]}}``.
+    A new ``Turn`` starts on every ``role:user`` event whose text contains a non-empty
+    ``<user_query>...</user_query>`` block (system-injected user events without a real
+    query are skipped). Tool attribution mirrors the .txt parser: ``Read|Glob|Grep``
+    → ``files_read``, ``Write|StrReplace|Delete`` → ``files_edited``.
+    """
+    turns: list[Turn] = []
+    cur: Turn | None = None
+    cur_assistant_parts: list[str] = []
+    running_offset = start_offset
+
+    def _flush() -> None:
+        if cur is not None:
+            cur.assistant_text = "\n".join(cur_assistant_parts)[:2000]
+            turns.append(cur)
+
+    for raw_line in text.splitlines(keepends=True):
+        line_len = len(raw_line)
+        stripped = raw_line.strip()
+        if not stripped:
+            running_offset += line_len
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            running_offset += line_len
+            continue
+
+        role = event.get("role")
+        content = (event.get("message") or {}).get("content") or []
+
+        if role == "user":
+            user_text = "\n".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+            q = re.search(r"<user_query>\s*(.*?)\s*</user_query>", user_text, re.DOTALL)
+            user_query = q.group(1).strip() if q else ""
+            if not user_query:
+                running_offset += line_len
+                continue
+            _flush()
+            cur = Turn(
+                index=len(turns),
+                user_query=user_query[:200],
+                assistant_text="",
+                byte_offset=running_offset,
+            )
+            cur_assistant_parts = []
+        elif role == "assistant" and cur is not None:
+            for b in content:
+                t = b.get("type")
+                if t == "text":
+                    txt = (b.get("text") or "").strip()
+                    if txt:
+                        cur_assistant_parts.append(txt)
+                elif t == "tool_use":
+                    name = b.get("name") or ""
+                    inp = b.get("input") or {}
+                    if name and name not in cur.tools_called:
+                        cur.tools_called.append(name)
+                    p = inp.get("path")
+                    if isinstance(p, str) and p:
+                        if name in ("Read", "Glob", "Grep") and p not in cur.files_read:
+                            cur.files_read.append(p)
+                        elif name in ("Write", "StrReplace", "Delete") and p not in cur.files_edited:
+                            cur.files_edited.append(p)
+
+        running_offset += line_len
+
+    _flush()
+    return turns
+
+
 def parse_turns(text: str, start_offset: int = 0) -> list[Turn]:
-    """Parse a transcript .txt file (or a tail of one) into Turn objects."""
+    """Parse a transcript .txt file (or a tail of one) into Turn objects.
+
+    Legacy text-dump format (pre-JSONL Cursor transcripts). Kept as a fallback
+    for old projects; current Cursor transcripts are JSONL — see ``parse_turns_jsonl``.
+    """
     blocks = re.split(r"^user:\s*$", text, flags=re.MULTILINE)
     turns: list[Turn] = []
     running_offset = start_offset
@@ -398,7 +478,9 @@ def distill_transcript(
     else:
         return []
 
-    new_turns = parse_turns(new_content, byte_offset)
+    parser = parse_turns_jsonl if p.suffix == ".jsonl" else parse_turns
+
+    new_turns = parser(new_content, byte_offset)
     if not new_turns:
         db_mod.save_transcript_state(conn, transcript_path, {
             **state,
@@ -420,7 +502,7 @@ def distill_transcript(
 
     # Re-parse the full transcript so the session chunk always reflects every turn,
     # not just the new ones. The chunk is upserted per call.
-    all_turns = parse_turns(content)
+    all_turns = parser(content)
     for i, t in enumerate(all_turns):
         t.index = i
     total_turns = len(all_turns)
@@ -490,10 +572,18 @@ def distill_all_transcripts(
         td_path = Path(os.path.expanduser(td))
         if not td_path.is_dir():
             continue
-        for txt_file in sorted(td_path.glob("*.txt")):
-            state = db_mod.load_transcript_state(conn, str(txt_file))
+
+        # Cursor's current layout: <td>/<uuid>/<uuid>.jsonl plus optional
+        # <td>/<uuid>/subagents/<uuid>.jsonl. Subagent transcripts are not
+        # citeable, so we exclude them.
+        jsonl_files = [f for f in td_path.rglob("*.jsonl") if "subagents" not in f.parts]
+        # Legacy text-dump format from older Cursor versions.
+        txt_files = list(td_path.glob("*.txt"))
+
+        for transcript_file in sorted(jsonl_files + txt_files):
+            state = db_mod.load_transcript_state(conn, str(transcript_file))
             try:
-                stat = txt_file.stat()
+                stat = transcript_file.stat()
                 mtime = stat.st_mtime
                 fsize = stat.st_size
             except OSError:
@@ -502,7 +592,7 @@ def distill_all_transcripts(
                 continue
 
             new_chunks = distill_transcript(
-                str(txt_file), conn, output,
+                str(transcript_file), conn, output,
                 gemma_every_n=gemma_every_n, use_gemma=use_gemma,
             )
 
@@ -510,9 +600,9 @@ def distill_all_transcripts(
                 flush_fn(new_chunks)
             total_new += len(new_chunks)
 
-            st = db_mod.load_transcript_state(conn, str(txt_file))
+            st = db_mod.load_transcript_state(conn, str(transcript_file))
             st["last_mtime"] = mtime
-            db_mod.save_transcript_state(conn, str(txt_file), st)
+            db_mod.save_transcript_state(conn, str(transcript_file), st)
 
     return total_new
 
