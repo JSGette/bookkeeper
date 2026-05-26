@@ -33,7 +33,7 @@ Transcripts → Background Watcher → Turn Parser → Gemma Summarizer → Sess
 
 | Tool | Description |
 |------|-------------|
-| `query_knowledge_base(query, max_results, source)` | Hybrid semantic + keyword search. Returns document summaries and pointers, not raw text |
+| `query_knowledge_base(query, max_results, source)` | Hybrid semantic + keyword search. Returns `{results, meta}` with per-result `confidence` bands; `meta.weak_match` and `meta.repeated_query` carry a `hint` string the agent should obey instead of rephrasing |
 | `get_full_document(path, source)` | Retrieve the full content of a document when the summary isn't sufficient |
 | `reindex(source)` | Rebuild index (incremental via git diff). Session chunks are preserved |
 | `list_sources()` | Show configured sources and chunk counts |
@@ -53,17 +53,28 @@ pip install -e ".[perf]"   # hnswlib for ANN search on large corpora
 pip install -e ".[all]"    # both
 ```
 
-Register in `~/.cursor/mcp.json`:
+Install the shared daemon and register it in `~/.cursor/mcp.json`:
+
+```bash
+./install.sh           # default: one shared HTTP daemon for all Cursor windows
+./install.sh --stdio   # legacy: per-Cursor-window subprocess
+```
+
+In daemon mode (recommended), `install.sh` runs:
+- `agents-rag daemon install` to write the platform unit (launchd on macOS, systemd-user on Linux).
+- `agents-rag daemon start` to launch on the first free port at/after 8765.
+- Rewrites `~/.cursor/mcp.json` to a URL entry so every Cursor window shares one process:
 
 ```json
 {
   "mcpServers": {
-    "agents-rag": {
-      "command": "agents-rag"
-    }
+    "agents-rag": { "url": "http://127.0.0.1:8765/mcp" }
   }
 }
 ```
+
+Manage the daemon with `agents-rag daemon {start|stop|restart|status|logs}`. Status prints
+the port, liveness, and log paths. Logs live under `~/.cache/agents-rag/logs/`.
 
 ## Configuration
 
@@ -97,8 +108,10 @@ sessions:
   watch_interval_minutes: 5     # background scan interval (0 to disable)
 
 search:
-  score_threshold_z: 0.8        # z-score multiplier for result filtering (default 0.8)
-  min_results: 2                # minimum results returned per query (default 2)
+  score_threshold_z: 0.8            # z-score multiplier for result filtering (default 0.8)
+  min_results: 2                    # minimum results returned per query (default 2)
+  dedupe_similarity_threshold: 0.88 # cosine threshold above which a recent query is treated as a duplicate
+  dedupe_window_seconds: 120        # how far back to look when checking for duplicate queries
 
 model: BAAI/bge-small-en-v1.5
 cache_dir: ~/.cache/agents-rag

@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 from fastmcp import FastMCP
 
 from . import db, reranker
@@ -26,26 +27,69 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 log = logging.getLogger(__name__)
 
 
+def _weak_match_hint(meta: dict) -> str:
+    """Hint string returned to the agent when the top result is low-confidence
+    or there are no results. Phrased to discourage paraphrase loops."""
+    if meta["confidence"] == "none":
+        return (
+            "No results passed the relevance threshold. The corpus likely does "
+            "not cover this topic — do NOT keep rephrasing. Read source files "
+            "directly, or call `status` to verify the index is loaded."
+        )
+    return (
+        "Top result confidence is low. The retriever could not find a strong "
+        "match. Avoid rephrasing the same query — open the highest-scoring "
+        "result with `get_full_document` to confirm relevance, or read source "
+        "files directly. Repeated paraphrases of an unanswerable query show up "
+        "in the audit log and waste both our time."
+    )
+
+
+def _ts_to_epoch(timestamp: str) -> float:
+    """Parse an ISO-8601 'YYYY-MM-DDTHH:MM:SSZ' timestamp into epoch seconds."""
+    try:
+        return time.mktime(time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return time.time()
+
+
 _USAGE_GUIDE = """\
 # agents-rag Usage Guide
 
 Query results are prior notes and hypotheses, not ground truth — they may be outdated.
+
+## Response shape
+
+`query_knowledge_base` returns `{"results": [...], "meta": {...}}`. Each result \
+has a `confidence` band ("high"|"medium"|"low"); `meta` carries:
+
+- `scoring`: "rerank" | "rrf" | "cached"
+- `confidence`: overall band (top result's band)
+- `weak_match`: true when the top result is low-confidence or empty
+- `repeated_query`: true when this query was deduped against a recent near-duplicate
+- `hint`: human-readable string telling you what to do next when `weak_match` or \
+  `repeated_query` is set. **Read and obey the hint** — it exists because the audit \
+  log keeps catching agents in paraphrase loops.
 
 ## Workflow
 
 1. Call `query_knowledge_base` with a short natural-language query. Use `source` \
 to filter by source name, or omit for all sources. Prefer recent `indexed_at` — \
 older docs are more likely stale.
-2. **Triage by summary only.** Read the `summary` (document results) or \
+2. **Check `meta.weak_match` and `meta.repeated_query` first.** If either is true, \
+read `meta.hint` and follow it. Do NOT rephrase the same query — the retriever \
+told you it cannot find a strong match. Read source files directly, or accept \
+that the corpus lacks coverage.
+3. **Triage by summary only.** Read the `summary` (document results) or \
 `session_summary` (session results) just to decide which hits are relevant to \
 your task. Do not paraphrase, quote, or act on a result based on its summary alone.
-3. **Fetch the full document** for every result you intend to use beyond the \
+4. **Fetch the full document** for every result you intend to use beyond the \
 relevance gate. Call `get_full_document` with the result's `path` and `source`. \
 Then jump to `matched_sections` (and `start_line`/`end_line` for document hits) \
 first.
-4. **Verify against current code.** If a result references source files, configs, \
+5. **Verify against current code.** If a result references source files, configs, \
 or code paths, read those sources too. The doc is a pointer; the code is the truth.
-5. **Save context at the end.** When the work session is meaningful (implementation, \
+6. **Save context at the end.** When the work session is meaningful (implementation, \
 investigation, debugging), call `save_session` with title, summary, decisions, \
 relevant_files, next_steps so the next chat can resume without re-discovering context.
 
@@ -121,6 +165,8 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     score_threshold_z = float(search_config.get("score_threshold_z", 0.8))
     min_results = int(search_config.get("min_results", 2))
     rrf_k = int(search_config.get("rrf_k", 10))
+    dedupe_threshold = float(search_config.get("dedupe_similarity_threshold", 0.88))
+    dedupe_window_seconds = int(search_config.get("dedupe_window_seconds", 120))
 
     reranker_config = config.get("reranker", {})
     reranker_enabled = bool(reranker_config.get("enabled", True))
@@ -128,6 +174,23 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     reranker_pool_multiplier = int(reranker_config.get("pool_multiplier", 6))
 
     conn = db.init_db(db_path)
+
+    # Checkpoint+truncate the WAL on clean shutdown so SIGTERMs from
+    # launchd/systemd don't leave 100MB+ -wal files behind. kill -9 still
+    # skips this (atexit doesn't run), but normal `daemon stop` will.
+    import atexit
+    def _checkpoint_and_close() -> None:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    atexit.register(_checkpoint_and_close)
+
     searcher = Searcher(
         conn,
         reranker_enabled=reranker_enabled,
@@ -223,6 +286,15 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     def _flush_transcript_chunks(chunks: list[dict]) -> None:
         index_q.put(chunks)
 
+    # Eager load: in HTTP transport mode multiple Cursor windows race the
+    # lazy first-call `searcher.load()` and serialise on the SQLite mutex,
+    # which can pin queries past Cursor's MCP timeout. Pay the ~2s build
+    # cost once at startup instead.
+    try:
+        searcher.load()
+    except Exception:
+        log.exception("Searcher eager-load failed; falling back to lazy load")
+
     mcp = FastMCP(name="agents-rag")
 
     if transcript_dirs and watch_interval > 0:
@@ -250,6 +322,13 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     def query_knowledge_base(query: str, max_results: int = 5, source: str | None = None) -> str:
         """Search the knowledge base for documentation relevant to a query.
 
+        Returns a JSON envelope: {"results": [...], "meta": {...}}. Each result
+        carries a `confidence` band ("high"|"medium"|"low"). The `meta` block
+        reports `scoring` ("rerank"|"rrf"|"cached"), overall `confidence`,
+        `weak_match` flag, and a `hint` string when the search is weak or the
+        query is a near-duplicate of a recent one — read the hint and act on it
+        instead of rephrasing.
+
         Results contain document-level summaries, not raw text. Treat the
         `summary` / `session_summary` as a relevance hint only — call
         `get_full_document` with the result's `path` and `source` before
@@ -265,27 +344,136 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         if not searcher._metadata:
             searcher.load()
         if not searcher._metadata:
-            return json.dumps({"error": "Index is empty. Run reindex first."})
+            return json.dumps({
+                "results": [],
+                "meta": {"error": "Index is empty. Run reindex first."},
+            })
 
         t0 = time.monotonic()
+        query_vec = searcher.embed_query(query)
+        query_blob = query_vec.astype(np.float32).tobytes()
+
+        cached = _check_recent_duplicate(query_vec, source)
+        if cached is not None:
+            envelope = _build_cached_envelope(query, cached)
+            payload = json.dumps(envelope, indent=2)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            try:
+                db.log_query(
+                    conn, query, source, max_results,
+                    len(envelope["results"]), payload, latency_ms,
+                    reranker_used=cached["reranker_used"],
+                    rrf_k=cached["rrf_k"],
+                    score_kind="cached",
+                    query_embedding=query_blob,
+                )
+            except Exception:
+                log.warning("Failed to log cached query to audit table", exc_info=True)
+            return payload
+
         results, query_meta = searcher.query_with_meta(
             query, top_k=max_results, source=source,
             score_threshold_z=score_threshold_z, min_results=min_results,
+            query_embedding=query_vec,
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
 
-        result_json = json.dumps(results, indent=2)
+        envelope = {
+            "results": results,
+            "meta": {
+                "scoring": query_meta["score_kind"],
+                "rrf_k": query_meta["rrf_k"],
+                "reranker_used": query_meta["reranker_used"],
+                "confidence": query_meta["confidence"],
+                "weak_match": query_meta["weak_match"],
+                "hint": _weak_match_hint(query_meta) if query_meta["weak_match"] else None,
+            },
+        }
+        payload = json.dumps(envelope, indent=2)
         try:
             db.log_query(
-                conn, query, source, max_results, len(results), result_json, latency_ms,
+                conn, query, source, max_results, len(results), payload, latency_ms,
                 reranker_used=query_meta["reranker_used"],
                 rrf_k=query_meta["rrf_k"],
                 score_kind=query_meta["score_kind"],
+                query_embedding=query_blob,
             )
         except Exception:
             log.warning("Failed to log query to audit table", exc_info=True)
 
-        return result_json
+        return payload
+
+    def _check_recent_duplicate(query_vec: np.ndarray, source_filter: str | None) -> dict | None:
+        """Return the most similar recent query above the dedupe threshold, or None."""
+        try:
+            recent = db.get_recent_query_embeddings(
+                conn, source_filter,
+                since_seconds=dedupe_window_seconds, limit=5,
+            )
+        except Exception:
+            log.warning("Failed to read recent query embeddings", exc_info=True)
+            return None
+        if not recent:
+            return None
+
+        q = query_vec.astype(np.float32)
+        q_norm = float(np.linalg.norm(q)) or 1.0
+        best: tuple[float, dict] | None = None
+        for row in recent:
+            blob = row.get("query_embedding")
+            if not blob:
+                continue
+            try:
+                v = np.frombuffer(blob, dtype=np.float32)
+            except ValueError:
+                continue
+            if v.shape != q.shape:
+                continue
+            v_norm = float(np.linalg.norm(v)) or 1.0
+            sim = float(np.dot(q, v) / (q_norm * v_norm))
+            if sim >= dedupe_threshold and (best is None or sim > best[0]):
+                best = (sim, {**row, "similarity": round(sim, 4)})
+        return best[1] if best else None
+
+    def _build_cached_envelope(current_query: str, cached: dict) -> dict:
+        """Reconstruct a response envelope from a prior logged query."""
+        try:
+            prior_payload = json.loads(cached["results_json"])
+        except (json.JSONDecodeError, TypeError):
+            prior_payload = []
+        # Audit log can contain either legacy list-shaped payloads or the new
+        # envelope shape; normalise so cached returns look like the new shape.
+        if isinstance(prior_payload, dict) and "results" in prior_payload:
+            prior_results = prior_payload.get("results", [])
+        elif isinstance(prior_payload, list):
+            prior_results = prior_payload
+        else:
+            prior_results = []
+
+        seconds_ago = max(0, int(time.time() - _ts_to_epoch(cached["timestamp"])))
+        hint = (
+            f"This query is a near-duplicate (cosine={cached['similarity']}) of "
+            f"a query made {seconds_ago}s ago: \"{cached['query']}\" "
+            f"(audit id {cached['id']}). Returning prior results unchanged. "
+            "Stop rephrasing — call `get_full_document` on the results you care "
+            "about, or read source files directly. If the corpus genuinely "
+            "lacks coverage, no amount of rewording will fix it."
+        )
+        return {
+            "results": prior_results,
+            "meta": {
+                "scoring": "cached",
+                "rrf_k": cached["rrf_k"],
+                "reranker_used": cached["reranker_used"],
+                "confidence": "high" if prior_results else "none",
+                "weak_match": not prior_results,
+                "repeated_query": True,
+                "previous_query_id": cached["id"],
+                "previous_query": cached["query"],
+                "similarity": cached["similarity"],
+                "hint": hint,
+            },
+        }
 
     _reindex_status: dict = {"running": False, "last_result": None}
     _reindex_lock = threading.Lock()
@@ -650,10 +838,55 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     return mcp
 
 
-def main():
-    mcp = create_app()
-    mcp.run()
+def _run_stdio() -> None:
+    create_app().run()
+
+
+def _run_http(host: str, port: int) -> None:
+    """Run as a long-lived HTTP MCP server that all Cursor windows share."""
+    log.info("Starting agents-rag HTTP server on %s:%d", host, port)
+    create_app().run(transport="http", host=host, port=port)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Dispatches between stdio (default), HTTP, and daemon admin."""
+    import argparse
+    from . import daemon as _daemon
+
+    parser = argparse.ArgumentParser(prog="agents-rag")
+    sub = parser.add_subparsers(dest="cmd")
+
+    serve = sub.add_parser("serve", help="Run the MCP server (default if no subcommand)")
+    serve.add_argument("--http", action="store_true", help="HTTP transport (shared across Cursor windows)")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+
+    dctl = sub.add_parser("daemon", help="Manage the shared HTTP daemon")
+    dctl.add_argument("action", choices=["start", "stop", "restart", "reload", "status", "logs", "install"])
+    dctl.add_argument("--port", type=int, default=None,
+                      help="Override the persisted port (install/start)")
+    dctl.add_argument("--host", default=None,
+                      help="Bind host (install/start). Use 0.0.0.0 to expose on a "
+                           "trusted network (Tailscale, VPN). Default: 127.0.0.1")
+    dctl.add_argument("--follow", "-f", action="store_true", help="Tail logs (logs action)")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd is None or args.cmd == "serve":
+        if getattr(args, "http", False):
+            _run_http(args.host, args.port)
+        else:
+            _run_stdio()
+        return 0
+
+    if args.cmd == "daemon":
+        return _daemon.dispatch(
+            args.action, port=args.port, host=args.host, follow=args.follow,
+        )
+
+    parser.error(f"Unknown command: {args.cmd}")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

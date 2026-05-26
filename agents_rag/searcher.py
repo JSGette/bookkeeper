@@ -7,6 +7,7 @@ import math
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -25,6 +26,30 @@ log = logging.getLogger(__name__)
 # good candidate pool; a smaller K gives that pool a clearer head.
 RRF_K = 10
 _RERANK_PASSAGE_CHARS = 2000
+
+# Score → confidence band. Thresholds chosen empirically from the audit log:
+# the BGE reranker outputs ~0.5 for "no clear match" and ~0.7+ for strong
+# matches. RRF scores live on a different scale (0–0.1 typical) because they
+# are sums of 1/(k+rank) over two retrievers.
+_RERANK_HIGH = 0.6
+_RERANK_LOW = 0.4
+_RRF_HIGH = 0.04
+_RRF_LOW = 0.015
+
+
+def _confidence_for(score: float, score_kind: str) -> str:
+    if score_kind == "rerank":
+        if score >= _RERANK_HIGH:
+            return "high"
+        if score >= _RERANK_LOW:
+            return "medium"
+        return "low"
+    # rrf (and the future "cached" branch reuses the original kind anyway)
+    if score >= _RRF_HIGH:
+        return "high"
+    if score >= _RRF_LOW:
+        return "medium"
+    return "low"
 
 
 def _tokenize(text: str) -> list[str]:
@@ -50,6 +75,10 @@ class Searcher:
         self._reranker_model = reranker_model
         self._reranker_pool_multiplier = max(1, reranker_pool_multiplier)
         self._rrf_k = max(1, rrf_k)
+        # Serialises load()/reload(). Without this, every Cursor window
+        # racing the daemon's first-call gate fires a parallel index build
+        # and they pile up on the SQLite connection mutex for minutes.
+        self._load_lock = threading.Lock()
 
     def _build_bm25(self) -> None:
         if not self._metadata:
@@ -122,6 +151,10 @@ class Searcher:
             log.warning("Failed to cache HNSW index: %s", exc)
 
     def load(self) -> bool:
+        with self._load_lock:
+            return self._load_locked()
+
+    def _load_locked(self) -> bool:
         meta, vecs = db.load_all_chunks(self.conn)
         if not meta:
             log.warning("No chunks in database")
@@ -153,12 +186,24 @@ class Searcher:
             counts[src] = counts.get(src, 0) + 1
         return counts
 
-    def _vector_search(self, query_text: str, n: int, source: str | None) -> list[tuple[int, int]]:
+    def embed_query(self, query_text: str) -> np.ndarray:
+        """Public hook so callers (e.g. the dedupe pre-check) can reuse the
+        embedding instead of paying for it twice per query."""
+        return embed_texts([query_text])[0]
+
+    def _vector_search(
+        self,
+        query_text: str,
+        n: int,
+        source: str | None,
+        query_vec: np.ndarray | None = None,
+    ) -> list[tuple[int, int]]:
         """Return [(index, rank)] from vector similarity. Uses HNSW when no source filter."""
         if self._vectors is None or self._metadata is None or len(self._vectors) == 0:
             return []
 
-        query_vec = embed_texts([query_text])[0]
+        if query_vec is None:
+            query_vec = embed_texts([query_text])[0]
 
         if self._hnsw is not None and source is None:
             labels, _distances = self._hnsw.knn_query(
@@ -271,18 +316,26 @@ class Searcher:
         source: str | None = None,
         score_threshold_z: float = 0.8,
         min_results: int = 2,
+        query_embedding: np.ndarray | None = None,
     ) -> tuple[list[dict], dict]:
         """Same as query() but also returns scoring-path metadata for auditing.
 
-        meta keys: reranker_used (bool), rrf_k (int), score_kind ("rerank"|"rrf").
+        meta keys: reranker_used (bool), rrf_k (int), score_kind ("rerank"|"rrf"),
+        confidence ("high"|"medium"|"low"|"none"), weak_match (bool).
         """
-        query_meta = {"reranker_used": False, "rrf_k": self._rrf_k, "score_kind": "rrf"}
+        query_meta = {
+            "reranker_used": False,
+            "rrf_k": self._rrf_k,
+            "score_kind": "rrf",
+            "confidence": "none",
+            "weak_match": True,
+        }
         if self._vectors is None or self._metadata is None or len(self._metadata) == 0:
             return [], query_meta
 
         rerank_pool = top_k * self._reranker_pool_multiplier if self._reranker_enabled else top_k
         candidate_n = max(top_k * 3, rerank_pool)
-        vector_results = self._vector_search(query_text, candidate_n, source)
+        vector_results = self._vector_search(query_text, candidate_n, source, query_vec=query_embedding)
         bm25_results = self._bm25_search(query_text, candidate_n, source)
         fused_indices, scores = self._rrf_fuse(vector_results, bm25_results, rerank_pool)
 
@@ -390,6 +443,15 @@ class Searcher:
         for group in session_groups.values():
             results.append(group)
         results.sort(key=lambda r: r.get("score", 0), reverse=True)
+
+        score_kind = query_meta["score_kind"]
+        for r in results:
+            r["confidence"] = _confidence_for(r.get("score", 0.0), score_kind)
+        if results:
+            top_band = results[0]["confidence"]
+            query_meta["confidence"] = top_band
+            query_meta["weak_match"] = top_band == "low"
+        # Empty results: weak_match=True / confidence="none" already set above.
 
         return results, query_meta
 

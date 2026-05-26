@@ -5,43 +5,67 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_JSON="$HOME/.cursor/mcp.json"
 RULES_DIR="$HOME/.cursor/rules"
 RULE_FILE="$RULES_DIR/agents-rag.md"
+CONFIG_YAML="$SCRIPT_DIR/config.yaml"
 
-# Kill any existing agents-rag server processes to avoid SQLite lock contention
+# Flags. Default is shared-daemon mode; --stdio keeps the legacy per-window spawn.
+MODE="daemon"
+for arg in "$@"; do
+    case "$arg" in
+        --stdio) MODE="stdio" ;;
+        --daemon) MODE="daemon" ;;
+    esac
+done
+
+# Kill any existing per-window stdio processes so they don't fight the daemon
+# for the SQLite WAL or hold stale code on the next Cursor restart.
 existing_pids=$(pgrep -f 'agents_rag\.server' || true)
 if [ -n "$existing_pids" ]; then
-    echo "==> Killing existing agents-rag server processes: $existing_pids"
+    echo "==> Killing existing agents-rag processes: $existing_pids"
     echo "$existing_pids" | xargs kill 2>/dev/null || true
     sleep 1
-    # Force-kill anything that didn't exit cleanly
     echo "$existing_pids" | xargs kill -9 2>/dev/null || true
 fi
 
 echo "==> Installing agents-rag from $SCRIPT_DIR"
 pip install -e "$SCRIPT_DIR"
 
-echo "==> Registering MCP server in $MCP_JSON"
-mkdir -p "$(dirname "$MCP_JSON")"
-python3 -c "
-import json, pathlib, sys
+if [ "$MODE" = "daemon" ]; then
+    echo "==> Installing shared daemon (one process across all Cursor windows)"
+    # Install + start the daemon; the helper picks a free port at/after 8765
+    # and persists it to ~/.cache/agents-rag/daemon.port.
+    AGENTS_RAG_CONFIG="$CONFIG_YAML" agents-rag daemon install >/dev/null
+    AGENTS_RAG_CONFIG="$CONFIG_YAML" agents-rag daemon start
+    PORT=$(cat "$HOME/.cache/agents-rag/daemon.port")
 
-mcp_path = pathlib.Path('$MCP_JSON')
-config_yaml = '$SCRIPT_DIR/config.yaml'
-
-if mcp_path.exists():
-    cfg = json.loads(mcp_path.read_text())
-else:
-    cfg = {}
-
+    echo "==> Registering MCP server (HTTP url) in $MCP_JSON"
+    mkdir -p "$(dirname "$MCP_JSON")"
+    MCP_JSON="$MCP_JSON" PORT="$PORT" python3 - <<'PYEOF'
+import json, os, pathlib
+mcp_path = pathlib.Path(os.environ['MCP_JSON'])
+port = int(os.environ['PORT'])
+cfg = json.loads(mcp_path.read_text()) if mcp_path.exists() else {}
+cfg.setdefault('mcpServers', {})
+cfg['mcpServers']['agents-rag'] = {'url': f'http://127.0.0.1:{port}/mcp'}
+mcp_path.write_text(json.dumps(cfg, indent=2) + '\n')
+print(f"  agents-rag registered as http://127.0.0.1:{port}/mcp")
+PYEOF
+else
+    echo "==> Registering MCP server (stdio) in $MCP_JSON"
+    mkdir -p "$(dirname "$MCP_JSON")"
+    MCP_JSON="$MCP_JSON" CONFIG_YAML="$CONFIG_YAML" python3 - <<'PYEOF'
+import json, os, pathlib
+mcp_path = pathlib.Path(os.environ['MCP_JSON'])
+cfg = json.loads(mcp_path.read_text()) if mcp_path.exists() else {}
 cfg.setdefault('mcpServers', {})
 cfg['mcpServers']['agents-rag'] = {
     'command': 'python',
     'args': ['-m', 'agents_rag.server'],
-    'env': {'AGENTS_RAG_CONFIG': config_yaml},
+    'env': {'AGENTS_RAG_CONFIG': os.environ['CONFIG_YAML']},
 }
-
 mcp_path.write_text(json.dumps(cfg, indent=2) + '\n')
-print(f'  agents-rag registered (config: {config_yaml})')
-"
+print(f"  agents-rag registered (stdio, config: {os.environ['CONFIG_YAML']})")
+PYEOF
+fi
 
 echo "==> Writing Cursor rule to $RULE_FILE"
 mkdir -p "$RULES_DIR"
@@ -104,4 +128,7 @@ Before starting analysis, investigation, or planning work:
 **Suppress this rule** when the user says "skip RAG", "skip AGENTS", or "from scratch".
 RULE_EOF
 
-echo "==> Done. Restart Cursor to pick up the MCP server."
+echo "==> Done. Restart Cursor windows to pick up the MCP server."
+if [ "$MODE" = "daemon" ]; then
+    echo "    Daemon controls: agents-rag daemon {start|stop|restart|status|logs}"
+fi

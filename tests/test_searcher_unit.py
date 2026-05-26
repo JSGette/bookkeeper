@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from agents_rag.db import init_db, upsert_chunks, upsert_document
-from agents_rag.searcher import Searcher, _tokenize
+from agents_rag.searcher import Searcher, _confidence_for, _tokenize
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +377,11 @@ def test_query_with_meta_reports_rerank_path(mock_embed, tmp_path):
         results, meta = searcher.query_with_meta("anything", top_k=3)
 
     assert results
-    assert meta == {"reranker_used": True, "rrf_k": 10, "score_kind": "rerank"}
+    assert meta["reranker_used"] is True
+    assert meta["rrf_k"] == 10
+    assert meta["score_kind"] == "rerank"
+    assert meta["confidence"] in {"high", "medium", "low"}
+    assert meta["weak_match"] is (meta["confidence"] == "low")
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
@@ -391,7 +395,11 @@ def test_query_with_meta_reports_rrf_when_reranker_off(mock_embed, tmp_path):
     searcher.load()
 
     _, meta = searcher.query_with_meta("anything", top_k=2)
-    assert meta == {"reranker_used": False, "rrf_k": 42, "score_kind": "rrf"}
+    assert meta["reranker_used"] is False
+    assert meta["rrf_k"] == 42
+    assert meta["score_kind"] == "rrf"
+    assert "confidence" in meta
+    assert "weak_match" in meta
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
@@ -418,7 +426,11 @@ def test_query_with_meta_empty_index(tmp_path):
     searcher.load()
     results, meta = searcher.query_with_meta("anything")
     assert results == []
-    assert meta == {"reranker_used": False, "rrf_k": 10, "score_kind": "rrf"}
+    assert meta["reranker_used"] is False
+    assert meta["rrf_k"] == 10
+    assert meta["score_kind"] == "rrf"
+    assert meta["confidence"] == "none"
+    assert meta["weak_match"] is True
 
 
 def test_passage_for_rerank_composes_title_heading_text(tmp_path):
@@ -433,6 +445,99 @@ def test_passage_for_rerank_composes_title_heading_text(tmp_path):
     assert "Auth Migration Plan" in passage
     assert "Step 2: token refresh" in passage
     assert "rotate tokens" in passage
+
+
+def test_confidence_for_rerank_thresholds():
+    assert _confidence_for(0.8, "rerank") == "high"
+    assert _confidence_for(0.6, "rerank") == "high"
+    assert _confidence_for(0.55, "rerank") == "medium"
+    assert _confidence_for(0.4, "rerank") == "medium"
+    assert _confidence_for(0.39, "rerank") == "low"
+    assert _confidence_for(0.0, "rerank") == "low"
+
+
+def test_confidence_for_rrf_thresholds():
+    assert _confidence_for(0.05, "rrf") == "high"
+    assert _confidence_for(0.04, "rrf") == "high"
+    assert _confidence_for(0.02, "rrf") == "medium"
+    assert _confidence_for(0.015, "rrf") == "medium"
+    assert _confidence_for(0.01, "rrf") == "low"
+    assert _confidence_for(0.0, "rrf") == "low"
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_query_with_meta_tags_per_result_confidence(mock_embed, tmp_path):
+    """Each result gets a confidence band matching its score and score_kind."""
+    conn = init_db(str(tmp_path / "test.db"))
+    _insert_doc_chunks(conn, [
+        ("a.md", "A", [("S1", "alpha beta")]),
+        ("b.md", "B", [("S2", "beta gamma")]),
+        ("c.md", "C", [("S3", "gamma delta")]),
+    ])
+    searcher = Searcher(conn, reranker_enabled=True, reranker_pool_multiplier=6, rrf_k=10)
+    searcher.load()
+
+    # Pin scores by content so we don't depend on RRF ordering of the candidates.
+    def fake_rerank(query, passages, model_name):
+        scores = []
+        for p in passages:
+            if "alpha" in p:
+                scores.append(0.9)
+            elif "delta" in p:
+                scores.append(0.5)
+            else:
+                scores.append(0.2)
+        return np.array(scores, dtype=np.float32)
+
+    with patch("agents_rag.searcher._rerank_fn", side_effect=fake_rerank):
+        results, meta = searcher.query_with_meta(
+            "anything", top_k=3,
+            score_threshold_z=-10.0, min_results=3,
+        )
+
+    bands = {r["path"]: r["confidence"] for r in results}
+    assert bands["a.md"] == "high"
+    assert meta["confidence"] == "high"
+    assert meta["weak_match"] is False
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_query_with_meta_flags_weak_match_when_top_is_low(mock_embed, tmp_path):
+    conn = init_db(str(tmp_path / "test.db"))
+    _insert_doc_chunks(conn, [
+        ("a.md", "A", [("S1", "alpha beta")]),
+        ("b.md", "B", [("S2", "beta gamma")]),
+    ])
+    searcher = Searcher(conn, reranker_enabled=True, rrf_k=10)
+    searcher.load()
+
+    def fake_rerank(query, passages, model_name):
+        return np.array([0.15, 0.1], dtype=np.float32)[:len(passages)]
+
+    with patch("agents_rag.searcher._rerank_fn", side_effect=fake_rerank):
+        results, meta = searcher.query_with_meta(
+            "anything", top_k=2,
+            score_threshold_z=-10.0, min_results=2,
+        )
+
+    assert results
+    assert meta["confidence"] == "low"
+    assert meta["weak_match"] is True
+
+
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_query_with_meta_accepts_precomputed_embedding(mock_embed, tmp_path):
+    """When the caller supplies a query embedding, we should not call embed_texts
+    again for vector search — saves one network/CPU hop per dedupe-hit path."""
+    conn = init_db(str(tmp_path / "test.db"))
+    _insert_doc_chunks(conn, [("a.md", "A", [("S1", "alpha")])])
+    searcher = Searcher(conn)
+    searcher.load()
+
+    mock_embed.reset_mock()
+    precomputed = np.ones(384, dtype=np.float32)
+    searcher.query_with_meta("anything", top_k=1, query_embedding=precomputed)
+    assert mock_embed.call_count == 0
 
 
 def test_passage_for_rerank_truncates_long_text(tmp_path):

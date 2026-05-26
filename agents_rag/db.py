@@ -80,8 +80,15 @@ CREATE TABLE IF NOT EXISTS query_log (
     latency_ms INTEGER NOT NULL,
     reranker_used INTEGER NOT NULL DEFAULT 0,
     rrf_k INTEGER NOT NULL DEFAULT 0,
-    score_kind TEXT NOT NULL DEFAULT 'rrf'
+    score_kind TEXT NOT NULL DEFAULT 'rrf',
+    query_embedding BLOB
 );
+
+-- Backs the dedupe pre-check (`get_recent_query_embeddings`) which fires
+-- on every search. Without this, the WHERE timestamp >= ? ORDER BY
+-- timestamp DESC LIMIT 5 degrades to a full table scan and pins the
+-- per-connection mutex once query_log accumulates real history.
+CREATE INDEX IF NOT EXISTS idx_query_log_timestamp ON query_log(timestamp);
 """
 
 
@@ -119,6 +126,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE query_log ADD COLUMN rrf_k INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE query_log ADD COLUMN score_kind TEXT NOT NULL DEFAULT 'rrf'")
         log.info("Migrated: added query_log.reranker_used / rrf_k / score_kind columns")
+    if qlog_cols and "query_embedding" not in qlog_cols:
+        conn.execute("ALTER TABLE query_log ADD COLUMN query_embedding BLOB")
+        log.info("Migrated: added query_log.query_embedding column")
 
 
 # ---------------------------------------------------------------------------
@@ -479,17 +489,22 @@ def log_query(
     reranker_used: bool = False,
     rrf_k: int = 0,
     score_kind: str = "rrf",
-) -> None:
+    query_embedding: bytes | None = None,
+) -> int:
+    """Insert one row into the audit log. Returns the row id so callers can
+    reference prior queries (e.g. for the repeated-query dedupe hint)."""
     with _write_lock:
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO query_log (timestamp, query, source_filter, top_k,
                                       result_count, results_json, latency_ms,
-                                      reranker_used, rrf_k, score_kind)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                      reranker_used, rrf_k, score_kind,
+                                      query_embedding)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (_now(), query, source_filter, top_k, result_count, results_json, latency_ms,
-             1 if reranker_used else 0, rrf_k, score_kind),
+             1 if reranker_used else 0, rrf_k, score_kind, query_embedding),
         )
         conn.commit()
+        return cur.lastrowid
 
 
 def get_recent_queries(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
@@ -506,6 +521,55 @@ def get_recent_queries(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
             "source_filter": r[3], "top_k": r[4], "result_count": r[5],
             "results_json": r[6], "latency_ms": r[7],
             "reranker_used": bool(r[8]), "rrf_k": r[9], "score_kind": r[10],
+        }
+        for r in rows
+    ]
+
+
+def get_recent_query_embeddings(
+    conn: sqlite3.Connection,
+    source_filter: str | None,
+    since_seconds: int = 120,
+    limit: int = 5,
+) -> list[dict]:
+    """Fetch recent queries (with embeddings) for the dedupe check.
+
+    Filters by source_filter equality (NULL matches NULL) so we don't dedupe
+    across unrelated source scopes. Excludes rows already served from cache
+    so a single user query can't dedupe against itself in a chain.
+    """
+    cutoff = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - since_seconds),
+    )
+    if source_filter is None:
+        rows = conn.execute(
+            """SELECT id, timestamp, query, results_json, query_embedding,
+                      reranker_used, rrf_k, score_kind
+               FROM query_log
+               WHERE source_filter IS NULL
+                 AND timestamp >= ?
+                 AND query_embedding IS NOT NULL
+                 AND score_kind != 'cached'
+               ORDER BY id DESC LIMIT ?""",
+            (cutoff, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, timestamp, query, results_json, query_embedding,
+                      reranker_used, rrf_k, score_kind
+               FROM query_log
+               WHERE source_filter = ?
+                 AND timestamp >= ?
+                 AND query_embedding IS NOT NULL
+                 AND score_kind != 'cached'
+               ORDER BY id DESC LIMIT ?""",
+            (source_filter, cutoff, limit),
+        ).fetchall()
+    return [
+        {
+            "id": r[0], "timestamp": r[1], "query": r[2],
+            "results_json": r[3], "query_embedding": r[4],
+            "reranker_used": bool(r[5]), "rrf_k": r[6], "score_kind": r[7],
         }
         for r in rows
     ]

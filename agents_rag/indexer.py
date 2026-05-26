@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -27,20 +28,35 @@ from .tagger import load_overrides, tag_file, description_from_content
 log = logging.getLogger(__name__)
 
 _model = None
+# Serialises the lazy SentenceTransformer init. Without this, concurrent
+# embed_texts() callers (HTTP transport spawns one tool-call thread per
+# Cursor window) each instantiate their own model, leak loky semaphores,
+# and have been observed to segfault.
+_model_lock = threading.Lock()
+# Serialises model.encode(). PyTorch's MPS backend is not thread-safe;
+# concurrent encode() from multiple HTTP worker threads segfaults in
+# native code (verified: exit 139 with 8 concurrent workers). One lock
+# also keeps CUDA streams sane and prevents oversubscribing the CPU
+# inference path. Per-call cost dominates anyway (~30-50ms), so the
+# serialisation tax is negligible compared to the search itself.
+_encode_lock = threading.Lock()
 
 
 def _get_model():
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
-        model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-        _model = SentenceTransformer(model_name)
+        with _model_lock:
+            if _model is None:
+                from sentence_transformers import SentenceTransformer
+                model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+                _model = SentenceTransformer(model_name)
     return _model
 
 
 def embed_texts(texts: list[str]) -> np.ndarray:
     model = _get_model()
-    return model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    with _encode_lock:
+        return model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
 
 
 # ---------------------------------------------------------------------------
