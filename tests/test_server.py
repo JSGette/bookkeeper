@@ -64,6 +64,19 @@ def test_load_config_from_env(tmp_path):
     assert config == {"sources": []}
 
 
+def test_load_usage_guide_handles_read_error(monkeypatch):
+    from agents_rag import server
+
+    monkeypatch.setattr("pathlib.Path.is_file", lambda _self: True)
+
+    def _raise_read_error(_self, encoding="utf-8"):  # pragma: no cover - called via monkeypatch
+        raise OSError("disk read error")
+
+    monkeypatch.setattr("pathlib.Path.read_text", _raise_read_error)
+    out = server._load_usage_guide()
+    assert "Usage guide file not found." in out
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------

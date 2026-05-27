@@ -59,7 +59,10 @@ def _ts_to_epoch(timestamp: str) -> float:
 def _load_usage_guide() -> str:
     path = Path(__file__).resolve().parent.parent / "docs" / "knowledge-base-protocol.md"
     if path.is_file():
-        return path.read_text(encoding="utf-8")
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning("Failed to read usage guide at %s: %s", path, exc)
     log.warning("Usage guide missing at %s", path)
     return "# agents-rag\n\nUsage guide file not found.\n"
 
