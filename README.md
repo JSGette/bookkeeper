@@ -78,6 +78,13 @@ In daemon mode (recommended), `install.sh` runs:
 Manage the daemon with `agents-rag daemon {start|stop|restart|status|logs}`. Status prints
 the port, liveness, and log paths. Logs live under `~/.cache/agents-rag/logs/`.
 
+`install.sh` also writes **`.cursor/rules/agents-rag.mdc`** (`alwaysApply: true`) into
+this repo and every `sources[].path` from `config.yaml` (e.g. `datadog-agent`). Cursor
+only loads rules from the **open workspace** — not from `~/.cursor/rules/`. After
+install, reload the window; the rule appears under **Settings → Rules → Project Rules**
+when that folder is open. For all repos without per-project files, paste
+`docs/knowledge-base-protocol.md` into **User Rules**.
+
 ## Configuration
 
 Config lookup order:
@@ -133,19 +140,14 @@ use_gemma: true
 
 ## Agent Usage Guidelines
 
-Query results are **prior notes and hypotheses, not ground truth** — they may be outdated. Results contain **summaries**, not raw text.
+Canonical protocol: [`docs/knowledge-base-protocol.md`](docs/knowledge-base-protocol.md)
+(MCP resource `agents-rag://usage-guide`; Cursor rule via `./install.sh`).
 
-1. Call `query_knowledge_base` with a short natural-language query.
-2. Use `source` to filter by name, or omit to search all.
-3. Prefer recently indexed docs — check `indexed_at`.
-4. **Document results** contain a `summary` (doc-level overview) and `matched_sections` showing which sections triggered the match.
-5. **Session results** contain a `session_summary` (distilled overview with decisions and next steps).
-6. If the summary is sufficient, use it directly. If you need exact code or full context, call `get_full_document` with the result's `path` and `source`.
-7. If a doc **references source files**, read those too — the doc is a pointer, the code is the truth.
-8. **Verify factual claims** against current source code before repeating them.
-9. `"deprecated": true` means historical context only.
-10. If a doc is **contradicted by current code**, call `deprecate_doc`.
-11. At the end of a work session, call `save_session` with a structured summary.
+High level: query RAG when prior context is likely relevant, then triage with
+`query_knowledge_base` → `prepare_cloud_context` before large cloud turns (use the
+`markdown` field) → `distill_blob` on large tool output →
+`get_full_document` only for exact quotes or verification → verify against current code →
+`save_session` when done.
 
 ## Session Memory
 

@@ -55,84 +55,15 @@ def _ts_to_epoch(timestamp: str) -> float:
         return time.time()
 
 
-_USAGE_GUIDE = """\
-# agents-rag Usage Guide
+def _load_usage_guide() -> str:
+    path = Path(__file__).resolve().parent.parent / "docs" / "knowledge-base-protocol.md"
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    log.warning("Usage guide missing at %s", path)
+    return "# agents-rag\n\nUsage guide file not found.\n"
 
-Query results are prior notes and hypotheses, not ground truth — they may be outdated.
 
-## Response shape
-
-`query_knowledge_base` returns `{"results": [...], "meta": {...}}`. Each result \
-has a `confidence` band ("high"|"medium"|"low"); `meta` carries:
-
-- `scoring`: "rerank" | "rrf" | "cached"
-- `confidence`: overall band (top result's band)
-- `weak_match`: true when the top result is low-confidence or empty
-- `repeated_query`: true when this query was deduped against a recent near-duplicate
-- `hint`: human-readable string telling you what to do next when `weak_match` or \
-  `repeated_query` is set. **Read and obey the hint** — it exists because the audit \
-  log keeps catching agents in paraphrase loops.
-
-## Workflow
-
-1. Call `query_knowledge_base` with a short natural-language query. Use `source` \
-to filter by source name, or omit for all sources. Prefer recent `indexed_at` — \
-older docs are more likely stale.
-2. **Check `meta.weak_match` and `meta.repeated_query` first.** If either is true, \
-read `meta.hint` and follow it. Do NOT rephrase the same query — the retriever \
-told you it cannot find a strong match. Read source files directly, or accept \
-that the corpus lacks coverage.
-3. **Triage by summary only.** Read the `summary` (document results) or \
-`session_summary` (session results) just to decide which hits are relevant to \
-your task. Do not paraphrase, quote, or act on a result based on its summary alone.
-4. **Fetch the full document** for every result you intend to use beyond the \
-relevance gate. Call `get_full_document` with the result's `path` and `source`. \
-Then jump to `matched_sections` (and `start_line`/`end_line` for document hits) \
-first.
-5. **Verify against current code.** If a result references source files, configs, \
-or code paths, read those sources too. The doc is a pointer; the code is the truth.
-6. **Save context at the end.** When the work session is meaningful (implementation, \
-investigation, debugging), call `save_session` with title, summary, decisions, \
-relevant_files, next_steps so the next chat can resume without re-discovering context.
-
-## When the summary alone is enough
-
-- Deciding "is this hit relevant to my task?" (the relevance gate in step 2).
-- Picking which file paths to read directly with the Read tool.
-
-That's it. Anything past relevance triage requires `get_full_document`.
-
-## When you MUST call `get_full_document`
-
-- Citing a specific fact, function name, config value, line number, PR/Jira ID, \
-or decision rationale to the user.
-- Summarising prior decisions or next steps from a session result. \
-`session_summary` is more self-contained than a doc `summary`, but it is still \
-a distillation — fetch the full session before treating its bullets as authoritative.
-- Continuing work described in a session (you need the complete \
-Decisions / Next Steps / Relevant Files lists, not the 2-3 sentence summary).
-- Whenever you are about to write or modify code based on a retrieved doc.
-- Whenever the user asks "what did we decide about X" or "where did we leave Y".
-
-## Invariants
-
-- Results with `"deprecated": true` are historical context only. Do not treat \
-their claims as current facts; mention them only if the user is asking about \
-past decisions or evolution of the codebase.
-- If during verification you find a doc's claim contradicted by current code, \
-call `deprecate_doc` with the doc path and a brief reason explaining what changed. \
-This keeps the knowledge base accurate for future queries.
-- Previous chat sessions are auto-indexed in the background and surface alongside \
-documentation. Treat them with the same rules as docs.
-
-## Notes
-
-- For subagents launched via the Task tool, call `get_context_block` with a query \
-relevant to the subagent's task and paste the returned text into the subagent's \
-prompt under "Prior context from knowledge base:". This keeps the subagent from \
-re-searching blindly.
-- Call `status` if `query_knowledge_base` returns unexpected results or errors.
-"""
+_USAGE_GUIDE = _load_usage_guide()
 
 
 # ---------------------------------------------------------------------------
