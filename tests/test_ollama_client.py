@@ -1,6 +1,12 @@
 """Tests for ollama_client profile routing."""
 
-from agents_rag.ollama_client import chat_json, configure, is_code_path, pick_profile
+from agents_rag.ollama_client import (
+    _model_lock_for,
+    chat_json,
+    configure,
+    is_code_path,
+    pick_profile,
+)
 
 
 def test_is_code_path():
@@ -67,3 +73,12 @@ def test_chat_json_unknown_profile_falls_back_to_fast(monkeypatch):
 
     assert out == {"ok": True}
     assert seen["model"] == "gemma-fallback"
+
+
+def test_model_lock_is_scoped_per_model():
+    lock_a1 = _model_lock_for("model-a")
+    lock_a2 = _model_lock_for("model-a")
+    lock_b = _model_lock_for("model-b")
+
+    assert lock_a1 is lock_a2
+    assert lock_a1 is not lock_b

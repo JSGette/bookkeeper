@@ -13,8 +13,19 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-# Serialise generative calls (MPS / single-GPU Ollama is not safely concurrent).
-_chat_lock = threading.Lock()
+# Serialise calls per loaded model to avoid cross-profile head-of-line blocking.
+# This keeps same-model requests safe while allowing fast/code profiles to run concurrently.
+_chat_locks_guard = threading.Lock()
+_chat_locks: dict[str, threading.Lock] = {}
+
+
+def _model_lock_for(model_name: str) -> threading.Lock:
+    with _chat_locks_guard:
+        lock = _chat_locks.get(model_name)
+        if lock is None:
+            lock = threading.Lock()
+            _chat_locks[model_name] = lock
+        return lock
 
 _CODE_EXTENSIONS = frozenset({
     ".go", ".py", ".bzl", ".bazel", ".rs", ".ts", ".tsx", ".js", ".jsx",
@@ -153,7 +164,7 @@ def chat_json(
             fallback.name,
         )
         prof = fallback
-    with _chat_lock:
+    with _model_lock_for(prof.name):
         try:
             options: dict[str, Any] = {
                 "temperature": 0.1,
