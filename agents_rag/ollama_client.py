@@ -84,7 +84,7 @@ def configure(config: dict) -> None:
         _configured = True
         return
 
-    profiles: dict[str, ModelProfile] = {}
+    profiles: dict[str, ModelProfile] = dict(_DEFAULT_PROFILES)
     for key, spec in models_cfg.items():
         if not isinstance(spec, dict):
             continue
@@ -98,8 +98,7 @@ def configure(config: dict) -> None:
             num_predict=int(spec.get("num_predict", base.num_predict)),
             num_ctx=int(opts["num_ctx"]) if opts.get("num_ctx") else base.num_ctx,
         )
-    if profiles:
-        _profiles = profiles
+    _profiles = profiles
     _configured = True
 
 
@@ -144,7 +143,16 @@ def chat_json(
     num_predict: int | None = None,
 ) -> dict[str, Any] | None:
     """Call Ollama /api/chat with JSON schema format; return parsed dict or None."""
-    prof = get_profile(profile)
+    try:
+        prof = get_profile(profile)
+    except KeyError:
+        fallback = _profiles.get("fast", _DEFAULT_PROFILES["fast"])
+        log.warning(
+            "Unknown profile %s; falling back to fast profile model=%s",
+            profile,
+            fallback.name,
+        )
+        prof = fallback
     with _chat_lock:
         try:
             options: dict[str, Any] = {
@@ -174,7 +182,16 @@ def chat_json(
 
 
 def truncate_for_profile(profile: str, text: str) -> str:
-    return text[: get_profile(profile).max_input_chars]
+    try:
+        return text[: get_profile(profile).max_input_chars]
+    except KeyError:
+        fallback = _profiles.get("fast", _DEFAULT_PROFILES["fast"])
+        log.warning(
+            "Unknown profile %s in truncate_for_profile; using fast limit=%d",
+            profile,
+            fallback.max_input_chars,
+        )
+        return text[: fallback.max_input_chars]
 
 
 def status() -> dict[str, Any]:

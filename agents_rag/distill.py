@@ -167,6 +167,7 @@ def prepare_cloud_context(
                     intent="code" if profile == "code" else "default",
                     path=path,
                     model_profile=profile,
+                    max_output_tokens=max_output_tokens,
                 )
                 entry["distilled"] = blob.get("digest", summary)
                 packet["meta"]["profile"] = blob.get("profile", profile)
@@ -189,7 +190,12 @@ def prepare_cloud_context(
             combined = f"{stdout}\n{stderr}".strip()
             if not combined:
                 continue
-            blob = distill_blob(combined, intent="tool_output", path=t.get("path", ""))
+            blob = distill_blob(
+                combined,
+                intent="tool_output",
+                path=t.get("path", ""),
+                max_output_tokens=max_output_tokens,
+            )
             packet["tool_digest"].append({
                 "tool": t.get("name", "shell"),
                 "distilled": blob.get("digest", combined[:1500]),
@@ -197,7 +203,11 @@ def prepare_cloud_context(
             })
 
     if user_prompt and len(user_prompt) > 500:
-        blob = distill_blob(user_prompt[:20_000], intent="default")
+        blob = distill_blob(
+            user_prompt[:20_000],
+            intent="default",
+            max_output_tokens=max_output_tokens,
+        )
         packet["open_questions"].append(
             "User task (distilled): " + blob.get("digest", user_prompt[:300])
         )
