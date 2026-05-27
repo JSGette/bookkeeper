@@ -72,70 +72,7 @@ if [ ! -f "$PROTOCOL" ]; then
 fi
 
 echo "==> Installing Cursor project rules (.cursor/rules/agents-rag.mdc)"
-CONFIG_YAML="$CONFIG_YAML" PROTOCOL="$PROTOCOL" SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PYEOF'
-import os
-import pathlib
-
-config_path = pathlib.Path(os.environ["CONFIG_YAML"])
-protocol_path = pathlib.Path(os.environ["PROTOCOL"])
-script_dir = pathlib.Path(os.environ["SCRIPT_DIR"])
-
-body = protocol_path.read_text(encoding="utf-8")
-body += (
-    '\n**Suppress this rule** when the user says "skip RAG", '
-    '"skip AGENTS", or "from scratch".\n'
-)
-frontmatter = (
-    "---\n"
-    "description: Pre-load context from personal knowledge base via RAG before analysis tasks\n"
-    "alwaysApply: true\n"
-    "---\n\n"
-)
-content = frontmatter + body
-
-def install_rule(repo_root: pathlib.Path) -> bool:
-    rules_dir = repo_root / ".cursor" / "rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    dest = rules_dir / "agents-rag.mdc"
-    dest.write_text(content, encoding="utf-8")
-    return True
-
-targets: list[pathlib.Path] = [script_dir]
-
-if config_path.is_file():
-  try:
-    import yaml  # type: ignore[import-not-found]
-  except ModuleNotFoundError:
-    print("  WARNING: python3 missing PyYAML; installing rule only in current repo.")
-  else:
-    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    for src in cfg.get("sources", []):
-      p = src.get("path")
-      if p:
-        targets.append(pathlib.Path(os.path.expanduser(p)))
-
-seen: set[pathlib.Path] = set()
-installed: list[str] = []
-for root in targets:
-    root = root.resolve()
-    if root in seen or not root.is_dir():
-        continue
-    seen.add(root)
-    install_rule(root)
-    installed.append(str(root / ".cursor" / "rules" / "agents-rag.mdc"))
-
-if not installed:
-    raise SystemExit("No rule targets installed")
-
-print("  Installed agents-rag.mdc (alwaysApply) to:")
-for path in installed:
-    print(f"    {path}")
-print()
-print("  Cursor loads these from Project Rules when that folder is the workspace.")
-print("  They do NOT appear under Settings → User Rules.")
-print("  For every-repo coverage without opening a specific folder, paste")
-print(f"  {protocol_path} into Settings → Rules → User Rules.")
-PYEOF
+python3 -m agents_rag.rule_installer "$CONFIG_YAML" "$PROTOCOL" "$SCRIPT_DIR"
 
 echo "==> Done. Restart Cursor windows to pick up the MCP server and project rules."
 if [ "$MODE" = "daemon" ]; then

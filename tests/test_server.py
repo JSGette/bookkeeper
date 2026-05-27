@@ -6,6 +6,7 @@ import json
 import os
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -570,3 +571,38 @@ def test_save_session_file(mock_s, mock_i, server_env):
     content = Path(filepath).read_text()
     assert "test session" in content
     assert "Did some testing." in content
+
+
+@patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+@patch("agents_rag.distill.distill_blob", return_value={"digest": "ok", "profile": "fast"})
+def test_prepare_cloud_context_during_reindex_has_no_errors(_mock_d, mock_s, mock_i, tmp_path):
+    mcp = _build_app(tmp_path)
+
+    started = json.loads(_call(mcp, "reindex"))
+    assert started["status"] in {"started", "already_running"}
+
+    def _call_prepare(i: int) -> dict:
+        payload = _call(
+            mcp,
+            "prepare_cloud_context",
+            query=f"setup {i}",
+            include_full_docs=True,
+            user_prompt="u" * 800,
+        )
+        return json.loads(payload)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        packets = list(pool.map(_call_prepare, range(6)))
+
+    for packet in packets:
+        assert "markdown" in packet
+        assert "prior_work" in packet
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        st = json.loads(_call(mcp, "status"))
+        if not st.get("reindex_running"):
+            break
+        time.sleep(0.1)
+    assert json.loads(_call(mcp, "status")).get("reindex_running") is False
