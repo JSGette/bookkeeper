@@ -494,6 +494,31 @@ def test_query_knowledge_base_skips_dedupe_across_source_filters(mock_s, mock_i,
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
+def test_dedupe_lookup_uses_read_only_connection(mock_s, mock_i, tmp_path, monkeypatch):
+    mcp = _build_app(tmp_path, {
+        "search": {"dedupe_similarity_threshold": 0.5, "dedupe_window_seconds": 60},
+    })
+
+    from agents_rag import db as db_mod
+
+    seen_query_only = []
+    orig = db_mod.get_recent_query_embeddings
+
+    def _wrapped(conn, source_filter, since_seconds=120, limit=5):
+        flag = conn.execute("PRAGMA query_only").fetchone()[0]
+        seen_query_only.append(int(flag))
+        return orig(conn, source_filter, since_seconds=since_seconds, limit=limit)
+
+    monkeypatch.setattr("agents_rag.server.db.get_recent_query_embeddings", _wrapped)
+
+    _call(mcp, "query_knowledge_base", query="setup guide", max_results=3)
+    _call(mcp, "query_knowledge_base", query="setup guide", max_results=3)
+    assert seen_query_only
+    assert all(v == 1 for v in seen_query_only)
+
+
+@patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
+@patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
 def test_create_app_skips_warmup_when_reranker_disabled(mock_s, mock_i, tmp_path):
     docs = tmp_path / "docs"
     docs.mkdir()

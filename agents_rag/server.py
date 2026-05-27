@@ -360,10 +360,11 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     def _check_recent_duplicate(query_vec: np.ndarray, source_filter: str | None) -> dict | None:
         """Return the most similar recent query above the dedupe threshold, or None."""
         try:
-            recent = db.get_recent_query_embeddings(
-                conn, source_filter,
-                since_seconds=dedupe_window_seconds, limit=5,
-            )
+            with _read_lock:
+                recent = db.get_recent_query_embeddings(
+                    read_conn, source_filter,
+                    since_seconds=dedupe_window_seconds, limit=5,
+                )
         except Exception:
             log.warning("Failed to read recent query embeddings", exc_info=True)
             return None
