@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -111,6 +112,15 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     reranker_pool_multiplier = int(reranker_config.get("pool_multiplier", 6))
 
     conn = db.init_db(db_path)
+    read_conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+    read_conn.execute("PRAGMA busy_timeout=30000")
+    read_conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        read_conn.execute("PRAGMA query_only=ON")
+    except Exception:
+        # Older SQLite builds may not support query_only; reads still work.
+        pass
+    _read_lock = threading.Lock()
 
     # Checkpoint+truncate the WAL on clean shutdown so SIGTERMs from
     # launchd/systemd don't leave 100MB+ -wal files behind. kill -9 still
@@ -124,6 +134,10 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             pass
         try:
             conn.close()
+        except Exception:
+            pass
+        try:
+            read_conn.close()
         except Exception:
             pass
     atexit.register(_checkpoint_and_close)
@@ -618,17 +632,24 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             path: The path field from a query result.
             source: The source field from the query result. If omitted, searches all sources.
         """
+        def _db_lookup() -> str | None:
+            with _read_lock:
+                if source:
+                    content = db.get_document_content(read_conn, source, path)
+                    if content:
+                        return content
+                else:
+                    row = read_conn.execute(
+                        "SELECT content FROM documents WHERE path=? LIMIT 1", (path,),
+                    ).fetchone()
+                    if row:
+                        return row[0]
+                return None
+
         # Try DB — search specific source or all sources
-        if source:
-            content = db.get_document_content(conn, source, path)
-            if content:
-                return content
-        else:
-            row = conn.execute(
-                "SELECT content FROM documents WHERE path=? LIMIT 1", (path,),
-            ).fetchone()
-            if row:
-                return row[0]
+        content = _db_lookup()
+        if content:
+            return content
 
         # Fall back to filesystem for session files
         p = Path(path)
@@ -672,7 +693,8 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         Args:
             limit: Maximum number of entries to return (default 20, most recent first).
         """
-        entries = db.get_recent_queries(conn, limit=limit)
+        with _read_lock:
+            entries = db.get_recent_queries(read_conn, limit=limit)
         return json.dumps(entries, indent=2)
 
     @mcp.tool
