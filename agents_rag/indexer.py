@@ -92,7 +92,7 @@ def extract_authored_summary(content: str) -> str:
     return body[:500]
 
 
-def summarize_document(content: str, title: str = "", use_gemma: bool = True) -> str:
+def summarize_document(content: str, title: str = "", use_gemma: bool = True, path: str = "") -> str:
     """Produce a 2-3 sentence document summary.
 
     Priority: authored ## Summary section > gemma > first-paragraph fallback.
@@ -106,40 +106,24 @@ def summarize_document(content: str, title: str = "", use_gemma: bool = True) ->
     if not use_gemma:
         return description_from_content(content)
 
-    try:
-        import httpx
-        from .tagger import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_KEEP_ALIVE
+    from . import ollama_client
 
-        excerpt = content[:30_000]
-        messages = [
-            {"role": "system", "content": (
-                "Summarize this document in 2-3 sentences. Focus on what the document "
-                "covers and its key conclusions or recommendations. Be specific — mention "
-                "exact tools, concepts, or decisions. Output JSON with a single 'summary' key."
-            )},
-            {"role": "user", "content": excerpt},
-        ]
-        resp = httpx.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "format": _DOC_SUMMARY_SCHEMA,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-                "options": {"temperature": 0.1, "num_predict": 512},
-            },
-            timeout=OLLAMA_TIMEOUT,
-        )
-        resp.raise_for_status()
-        import json as _json
-        raw = resp.json().get("message", {}).get("content", "")
-        data = _json.loads(raw)
-        summary = data.get("summary", "").strip()
+    profile = ollama_client.pick_profile("index_summary", path=path or title)
+    excerpt = ollama_client.truncate_for_profile(profile, content)
+    messages = [
+        {"role": "system", "content": (
+            "Summarize this document in 2-3 sentences. Focus on what the document "
+            "covers and its key conclusions or recommendations. Be specific — mention "
+            "exact tools, concepts, or decisions. Output JSON with a single 'summary' key."
+        )},
+        {"role": "user", "content": excerpt},
+    ]
+    data = ollama_client.chat_json(profile, messages, _DOC_SUMMARY_SCHEMA, num_predict=512)
+    if data:
+        summary = str(data.get("summary", "")).strip()
         if summary:
             return summary
-    except Exception as exc:
-        log.warning("Document summarization failed, using fallback: %s", exc)
+    log.warning("Document summarization failed, using fallback")
 
     return description_from_content(content)
 
@@ -259,7 +243,9 @@ def _persist_chunks_to_db(
             content = ""
         title = items[0][0].get("doc_title", "")
         preamble = items[0][0].get("doc_preamble", "")
-        summary = summarize_document(content, title=title, use_gemma=use_gemma)
+        summary = summarize_document(
+            content, title=title, use_gemma=use_gemma, path=rel_path,
+        )
         doc_id = upsert_document(
             conn, source_cfg.name, rel_path, title, preamble, content, summary=summary,
         )

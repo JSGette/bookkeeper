@@ -17,8 +17,10 @@ from fastmcp import FastMCP
 
 from . import db, reranker
 from .config import load_config, parse_sources, validate_config
+from .distill import distill_blob as _distill_blob, prepare_cloud_context as _prepare_cloud_context
 from .index_generator import update_index_file
 from .indexer import embed_texts, reindex_all
+from . import ollama_client
 from .searcher import Searcher
 from .tagger import configure as configure_tagger
 from .transcript import TranscriptWatcher, distill_all_transcripts
@@ -153,7 +155,11 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
     db_path = os.path.join(cache_dir, "agents-rag.db")
     use_gemma = config.get("use_gemma", True)
+    ollama_client.configure(config)
     configure_tagger(config)
+    runtime_distill = config.get("runtime_distill", {})
+    runtime_distill_enabled = bool(runtime_distill.get("enabled", True))
+    max_distill_docs = int(runtime_distill.get("max_distill_docs", 3))
 
     sessions_config = config.get("sessions", {})
     transcript_dirs = [os.path.expanduser(d) for d in sessions_config.get("transcript_dirs", [])]
@@ -752,19 +758,84 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             info["reindex_running"] = _reindex_status["running"]
             info["reindex_last_result"] = _reindex_status["last_result"]
 
-        try:
-            import httpx
-            from .tagger import OLLAMA_URL, OLLAMA_MODEL
-            resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-            models = [m["name"] for m in resp.json().get("models", [])]
-            info["ollama_reachable"] = True
-            info["ollama_model_loaded"] = any(OLLAMA_MODEL in m for m in models)
-            info["ollama_model"] = OLLAMA_MODEL
-        except Exception as exc:
-            info["ollama_reachable"] = False
-            info["ollama_error"] = str(exc)
+        ollama_st = ollama_client.status()
+        info["ollama"] = ollama_st
+        info["runtime_distill_enabled"] = runtime_distill_enabled
 
         return json.dumps(info, indent=2)
+
+    @mcp.tool
+    def distill_blob(
+        text: str,
+        intent: str = "default",
+        path: str = "",
+        model_profile: str = "",
+    ) -> str:
+        """Compress large text locally (Gemma or Qwen3-Coder) before cloud context.
+
+        Args:
+            text: Raw content (tool stdout, logs, file excerpt).
+            intent: default | tool_output | code
+            path: Optional file path hint for profile routing.
+            model_profile: Force 'fast' or 'code'; empty = auto.
+        """
+        if not runtime_distill_enabled:
+            return json.dumps({"error": "runtime_distill disabled in config", "digest": text[:2000]})
+        profile = model_profile.strip() or None
+        result = _distill_blob(text, intent, path=path, model_profile=profile)
+        return json.dumps(result, indent=2)
+
+    @mcp.tool
+    def prepare_cloud_context(
+        query: str,
+        max_output_tokens: int = 4000,
+        source: str = "",
+        include_full_docs: bool = False,
+        user_prompt: str = "",
+        tool_outputs_json: str = "",
+    ) -> str:
+        """Retrieve KB hits and distill into a packet for Claude (less token waste).
+
+        Args:
+            query: Search query for prior work.
+            max_output_tokens: Cap per local distill call.
+            source: Optional source filter (personal, repo, sessions).
+            include_full_docs: If true, fetch and distill top code/doc hits locally.
+            user_prompt: Current user task (optional).
+            tool_outputs_json: JSON list of {name, stdout, stderr} from shell tools.
+        """
+        if not runtime_distill_enabled:
+            return json.dumps({"error": "runtime_distill disabled", "markdown": ""})
+
+        if not searcher._metadata:
+            searcher.load()
+        src_filter = source.strip() or None
+        results = searcher.query(
+            query, top_k=5, source=src_filter,
+            score_threshold_z=score_threshold_z, min_results=min_results,
+        ) if searcher._metadata else []
+
+        tool_outputs = []
+        if tool_outputs_json.strip():
+            try:
+                tool_outputs = json.loads(tool_outputs_json)
+            except json.JSONDecodeError:
+                tool_outputs = []
+
+        def _get_doc(src: str, path: str) -> str:
+            return get_full_document(path, src)
+
+        packet = _prepare_cloud_context(
+            query,
+            results,
+            max_output_tokens=max_output_tokens,
+            include_full_docs=include_full_docs,
+            get_document_fn=_get_doc,
+            tool_outputs=tool_outputs if isinstance(tool_outputs, list) else None,
+            user_prompt=user_prompt or None,
+            max_distill_docs=max_distill_docs,
+        )
+        return json.dumps(packet, indent=2)
 
     @mcp.tool
     def gc(source: str | None = None) -> str:

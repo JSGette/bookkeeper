@@ -9,15 +9,15 @@ import os
 import re
 from pathlib import Path
 
-import httpx
 import yaml
 
 log = logging.getLogger(__name__)
 
+from . import ollama_client
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
-# Keep model loaded briefly for sequential requests, then auto-unload.
 _keep_alive_raw = os.environ.get("OLLAMA_KEEP_ALIVE", "2m")
 OLLAMA_KEEP_ALIVE: int | str = int(_keep_alive_raw) if _keep_alive_raw.lstrip("-").isdigit() else _keep_alive_raw
 
@@ -212,45 +212,20 @@ def generate_tags_gemma(text: str, rel_path: str, cache_dir: str, force: bool = 
         if cached is not None:
             return cached
 
-    messages = _build_messages(text)
-
-    try:
-        resp = httpx.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "format": _FORMAT_SCHEMA,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-                "options": {
-                    "temperature": 0.1,
-                    "top_p": 0.95,
-                    "top_k": 64,
-                    "num_predict": 1024,
-                    "repeat_penalty": 1.15,
-                },
-            },
-            timeout=OLLAMA_TIMEOUT,
-        )
-        resp.raise_for_status()
-        raw = resp.json().get("message", {}).get("content", "")
-    except Exception as exc:
-        log.warning("Ollama unavailable (%s), falling back to path-based tags for %s", exc, rel_path)
+    messages = _build_messages(ollama_client.truncate_for_profile("fast", text))
+    data = ollama_client.chat_json("fast", messages, _FORMAT_SCHEMA, num_predict=1024)
+    if not data:
+        log.warning("Ollama unavailable, falling back to path-based tags for %s", rel_path)
         return None
-
-    raw = re.sub(r"^```json?\s*", "", raw.strip())
-    raw = re.sub(r"\s*```$", "", raw.strip())
     try:
-        data = json.loads(raw)
         result = {
             "description": _clean_description(str(data.get("description", ""))),
             "tags": _clean_tags(data.get("tags", [])),
         }
         _save_cached_tags(cache_dir, rel_path, text, result)
         return result
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        log.warning("Failed to parse Gemma response for %s: %s — raw: %s", rel_path, exc, raw[:200])
+    except (KeyError, TypeError) as exc:
+        log.warning("Failed to parse tagger response for %s: %s", rel_path, exc)
         return None
 
 

@@ -40,6 +40,8 @@ Transcripts → Background Watcher → Turn Parser → Gemma Summarizer → Sess
 | `deprecate_doc(path, reason, undeprecate)` | Mark/unmark a doc as outdated |
 | `save_session(title, summary, ...)` | Persist a structured session summary for future retrieval |
 | `distill_transcripts()` | Force immediate scan and indexing of transcript directories |
+| `distill_blob(text, intent, ...)` | Locally compress logs/code/text (Gemma or Qwen3-Coder) before cloud context |
+| `prepare_cloud_context(query, ...)` | Search KB + optional full-doc distill → JSON packet + markdown for Claude |
 | `query_audit_log(limit)` | Return recent queries and their results for auditing |
 
 ## Setup

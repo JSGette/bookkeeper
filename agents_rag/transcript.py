@@ -15,13 +15,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
-
+from . import ollama_client
 from .tagger import (
-    OLLAMA_KEEP_ALIVE,
-    OLLAMA_MODEL,
-    OLLAMA_TIMEOUT,
-    OLLAMA_URL,
     _clean_description,
     _clean_tags,
     tags_from_path,
@@ -294,9 +289,11 @@ def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
         for t in turns
     )
 
-    content = skeleton[:50_000]
+    profile = ollama_client.pick_profile("transcript", code_heavy=_session_code_heavy(turns))
+    content = skeleton
     if raw_tail:
-        content += "\n\n--- Raw transcript tail ---\n" + raw_tail[-30_000:]
+        content += "\n\n--- Raw transcript tail ---\n" + raw_tail
+    content = ollama_client.truncate_for_profile(profile, content)
 
     messages = [
         {"role": "system", "content": (
@@ -310,31 +307,29 @@ def summarize_with_gemma(turns: list[Turn], raw_tail: str = "") -> dict | None:
         {"role": "user", "content": content},
     ]
 
-    try:
-        resp = httpx.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "format": _DISTILL_SCHEMA,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-                "options": {"temperature": 0.1, "num_predict": 2048},
-            },
-            timeout=OLLAMA_TIMEOUT,
-        )
-        resp.raise_for_status()
-        raw = resp.json().get("message", {}).get("content", "")
-        data = json.loads(raw)
-        return {
-            "summary": _clean_description(data.get("summary", "")) or data.get("summary", ""),
-            "decisions": data.get("decisions", [])[:5],
-            "next_steps": data.get("next_steps", [])[:5],
-            "tags": _clean_tags(data.get("tags", [])),
-        }
-    except Exception as exc:
-        log.warning("Gemma summarization failed: %s", exc)
+    data = ollama_client.chat_json(profile, messages, _DISTILL_SCHEMA, num_predict=2048)
+    if not data:
+        log.warning("Transcript summarization failed (profile=%s)", profile)
         return None
+    return {
+        "summary": _clean_description(data.get("summary", "")) or data.get("summary", ""),
+        "decisions": data.get("decisions", [])[:5],
+        "next_steps": data.get("next_steps", [])[:5],
+        "tags": _clean_tags(data.get("tags", [])),
+    }
+
+
+def _session_code_heavy(turns: list[Turn]) -> bool:
+    if not turns:
+        return False
+    code_tools = 0
+    for t in turns:
+        if t.files_read or t.files_edited:
+            code_tools += 1
+        for tool in t.tools_called:
+            if tool in ("Write", "StrReplace", "Grep", "Read"):
+                code_tools += 1
+    return code_tools >= max(2, len(turns) // 3)
 
 
 # ---------------------------------------------------------------------------
