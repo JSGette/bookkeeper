@@ -5,7 +5,7 @@ shared reranker, shared dedupe window. Backed by launchd on macOS and a
 user-scope systemd unit on Linux.
 
 The module is intentionally thin: the heavy lifting is delegated to launchctl /
-systemctl and the daemon process itself is `agents-rag serve --http`.
+systemctl and the daemon process itself is `bookkeeper serve --http`.
 """
 
 from __future__ import annotations
@@ -18,17 +18,17 @@ import sys
 import time
 from pathlib import Path
 
-CACHE_DIR = Path(os.path.expanduser("~/.cache/agents-rag"))
+CACHE_DIR = Path(os.path.expanduser("~/.cache/bookkeeper"))
 PORT_FILE = CACHE_DIR / "daemon.port"
 HOST_FILE = CACHE_DIR / "daemon.host"
 LOG_DIR = CACHE_DIR / "logs"
 STDOUT_LOG = LOG_DIR / "daemon.out.log"
 STDERR_LOG = LOG_DIR / "daemon.err.log"
 
-LABEL = "com.user.agents-rag"
+LABEL = "com.user.bookkeeper"
 LAUNCHD_PLIST = Path(os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist"))
 SYSTEMD_DIR = Path(os.path.expanduser("~/.config/systemd/user"))
-SYSTEMD_UNIT = SYSTEMD_DIR / "agents-rag.service"
+SYSTEMD_UNIT = SYSTEMD_DIR / "bookkeeper.service"
 
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
@@ -153,7 +153,7 @@ _PLIST_TEMPLATE = """\
 
 _SYSTEMD_TEMPLATE = """\
 [Unit]
-Description=agents-rag shared MCP daemon
+Description=bookkeeper shared MCP daemon
 After=network.target
 
 [Service]
@@ -263,7 +263,7 @@ def _launchctl(action: str) -> None:
 
 def _systemctl(action: str) -> None:
     mapping = {"start": "start", "stop": "stop", "reload": "restart"}
-    _run(["systemctl", "--user", mapping[action], "agents-rag.service"], check=False)
+    _run(["systemctl", "--user", mapping[action], "bookkeeper.service"], check=False)
 
 
 def _ctl(action: str) -> None:
@@ -356,7 +356,7 @@ def dispatch(
     if action == "install":
         chosen_host, chosen = install(port, host=host)
         print(f"Installed daemon on http://{chosen_host}:{chosen}/mcp. "
-              f"Run `agents-rag daemon start` to launch.")
+              f"Run `bookkeeper daemon start` to launch.")
         return 0
     if action == "start":
         # `daemon start --host X` re-installs first so the unit file picks up

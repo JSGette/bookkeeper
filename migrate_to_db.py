@@ -27,7 +27,7 @@ def migrate(cache_dir: str, source_roots: dict[str, str] | None = None) -> None:
     )
 
     cache = Path(cache_dir)
-    db_path = str(cache / "agents-rag.db")
+    db_path = str(cache / "bookkeeper.db")
 
     if Path(db_path).exists():
         log.warning("Database already exists at %s — aborting to avoid data loss", db_path)
@@ -172,7 +172,7 @@ def main() -> None:
         sys.exit(1)
 
     config = yaml.safe_load(Path(config_path).read_text()) or {}
-    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
+    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/bookkeeper"))
 
     source_roots: dict[str, str] = {}
     for s in config.get("sources", []):

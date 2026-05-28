@@ -64,7 +64,7 @@ def _load_usage_guide() -> str:
         except OSError as exc:
             log.warning("Failed to read usage guide at %s: %s", path, exc)
     log.warning("Usage guide missing at %s", path)
-    return "# agents-rag\n\nUsage guide file not found.\n"
+    return "# bookkeeper\n\nUsage guide file not found.\n"
 
 
 _USAGE_GUIDE = _load_usage_guide()
@@ -87,8 +87,8 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         for e in errors:
             log.error("Config error: %s", e)
     sources = parse_sources(config)
-    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
-    db_path = os.path.join(cache_dir, "agents-rag.db")
+    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/bookkeeper"))
+    db_path = os.path.join(cache_dir, "bookkeeper.db")
     use_gemma = config.get("use_gemma", True)
     ollama_client.configure(config)
     configure_tagger(config)
@@ -98,7 +98,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
 
     sessions_config = config.get("sessions", {})
     transcript_dirs = [os.path.expanduser(d) for d in sessions_config.get("transcript_dirs", [])]
-    sessions_output_dir = os.path.expanduser(sessions_config.get("output_dir", "~/.cache/agents-rag/sessions"))
+    sessions_output_dir = os.path.expanduser(sessions_config.get("output_dir", "~/.cache/bookkeeper/sessions"))
     gemma_every_n = sessions_config.get("gemma_every_n_turns", 3)
     watch_interval = sessions_config.get("watch_interval_minutes", 5)
 
@@ -249,7 +249,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     except Exception:
         log.exception("Searcher eager-load failed; falling back to lazy load")
 
-    mcp = FastMCP(name="agents-rag")
+    mcp = FastMCP(name="bookkeeper")
 
     if transcript_dirs and watch_interval > 0:
         watcher = TranscriptWatcher(
@@ -267,7 +267,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     # MCP resource + tools (closures over app state)
     # ------------------------------------------------------------------
 
-    @mcp.resource("agents-rag://usage-guide")
+    @mcp.resource("bookkeeper://usage-guide")
     def usage_guide() -> str:
         """Agent usage guidelines for consuming knowledge base results."""
         return _USAGE_GUIDE
@@ -288,7 +288,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
         `get_full_document` with the result's `path` and `source` before
         quoting facts, naming functions, citing decisions, continuing prior
         work, or writing code based on a result. See the
-        `agents-rag://usage-guide` resource for the full protocol.
+        `bookkeeper://usage-guide` resource for the full protocol.
 
         Args:
             query: Natural language query describing what you're looking for.
@@ -872,7 +872,7 @@ def _run_stdio() -> None:
 
 def _run_http(host: str, port: int) -> None:
     """Run as a long-lived HTTP MCP server that all Cursor windows share."""
-    log.info("Starting agents-rag HTTP server on %s:%d", host, port)
+    log.info("Starting bookkeeper HTTP server on %s:%d", host, port)
     create_app().run(transport="http", host=host, port=port)
 
 
@@ -881,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     from . import daemon as _daemon
 
-    parser = argparse.ArgumentParser(prog="agents-rag")
+    parser = argparse.ArgumentParser(prog="bookkeeper")
     sub = parser.add_subparsers(dest="cmd")
 
     serve = sub.add_parser("serve", help="Run the MCP server (default if no subcommand)")

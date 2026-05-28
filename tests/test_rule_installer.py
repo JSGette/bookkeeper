@@ -23,7 +23,7 @@ def test_install_project_rules_handles_missing_yaml_module(tmp_path, monkeypatch
     monkeypatch.setattr("agents_rag.rule_installer.importlib.import_module", _raise_for_yaml)
     installed = install_project_rules(config, protocol, script_dir)
 
-    assert installed == [script_dir / ".cursor" / "rules" / "agents-rag.mdc"]
+    assert installed == [script_dir / ".cursor" / "rules" / "bookkeeper.mdc"]
     assert installed[0].is_file()
 
 
@@ -44,5 +44,5 @@ def test_install_project_rules_installs_sources_from_config(tmp_path):
     installed = install_project_rules(config, protocol, script_dir)
     installed_set = {p.resolve() for p in installed}
 
-    assert (script_dir / ".cursor" / "rules" / "agents-rag.mdc").resolve() in installed_set
-    assert (docs_repo / ".cursor" / "rules" / "agents-rag.mdc").resolve() in installed_set
+    assert (script_dir / ".cursor" / "rules" / "bookkeeper.mdc").resolve() in installed_set
+    assert (docs_repo / ".cursor" / "rules" / "bookkeeper.mdc").resolve() in installed_set

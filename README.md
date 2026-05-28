@@ -1,4 +1,4 @@
-# agents-rag
+# bookkeeper
 
 MCP server for semantic search over local documentation, source code, and chat session history. Indexes configurable directory trees, embeds chunks with a local model, and exposes search via MCP stdio tools. Designed for Cursor — the agent calls `query_knowledge_base` instead of scanning files manually.
 
@@ -21,7 +21,7 @@ Transcripts → Background Watcher → Turn Parser → Gemma Summarizer → Sess
 | Module | Purpose |
 |--------|---------|
 | `chunker.py` | Multi-format chunking: markdown at `##` headings, source code via treesitter (optional) or fixed-size, with a configurable token ceiling |
-| `tagger.py` | Three-layer tagging: path-based → LLM via Ollama (cached) → manual `.agents-rag-meta.yaml` overrides. Prompt and examples are configurable |
+| `tagger.py` | Three-layer tagging: path-based → LLM via Ollama (cached) → manual `.bookkeeper-meta.yaml` overrides. Prompt and examples are configurable |
 | `indexer.py` | Embeds chunks with `BAAI/bge-small-en-v1.5`, generates document-level summaries via Gemma, persists to SQLite. Git-based delta reindex with mtime fallback |
 | `searcher.py` | Hybrid BM25 + vector cosine search fused via RRF. Returns document summaries + pointers instead of raw chunks. Configurable score-gap filtering, freshness boost, and optional HNSW for large corpora |
 | `transcript.py` | Parses Cursor agent transcripts into turn-level chunks with heuristic extraction and optional Gemma summarization. Background watcher flushes each transcript to the index immediately |
@@ -63,22 +63,22 @@ Install the shared daemon and register it in `~/.cursor/mcp.json`:
 ```
 
 In daemon mode (recommended), `install.sh` runs:
-- `agents-rag daemon install` to write the platform unit (launchd on macOS, systemd-user on Linux).
-- `agents-rag daemon start` to launch on the first free port at/after 8765.
+- `bookkeeper daemon install` to write the platform unit (launchd on macOS, systemd-user on Linux).
+- `bookkeeper daemon start` to launch on the first free port at/after 8765.
 - Rewrites `~/.cursor/mcp.json` to a URL entry so every Cursor window shares one process:
 
 ```json
 {
   "mcpServers": {
-    "agents-rag": { "url": "http://127.0.0.1:8765/mcp" }
+    "bookkeeper": { "url": "http://127.0.0.1:8765/mcp" }
   }
 }
 ```
 
-Manage the daemon with `agents-rag daemon {start|stop|restart|status|logs}`. Status prints
-the port, liveness, and log paths. Logs live under `~/.cache/agents-rag/logs/`.
+Manage the daemon with `bookkeeper daemon {start|stop|restart|status|logs}`. Status prints
+the port, liveness, and log paths. Logs live under `~/.cache/bookkeeper/logs/`.
 
-`install.sh` also writes **`.cursor/rules/agents-rag.mdc`** (`alwaysApply: true`) into
+`install.sh` also writes **`.cursor/rules/bookkeeper.mdc`** (`alwaysApply: true`) into
 this repo and every `sources[].path` from `config.yaml` (e.g. `datadog-agent`). Cursor
 only loads rules from the **open workspace** — not from `~/.cursor/rules/`. After
 install, reload the window; the rule appears under **Settings → Rules → Project Rules**
@@ -123,7 +123,7 @@ search:
   dedupe_window_seconds: 120        # how far back to look when checking for duplicate queries
 
 model: BAAI/bge-small-en-v1.5
-cache_dir: ~/.cache/agents-rag
+cache_dir: ~/.cache/bookkeeper
 use_gemma: true
 
 # Optional: override the LLM tagger prompt or few-shot examples
@@ -141,7 +141,7 @@ use_gemma: true
 ## Agent Usage Guidelines
 
 Canonical protocol: [`docs/knowledge-base-protocol.md`](docs/knowledge-base-protocol.md)
-(MCP resource `agents-rag://usage-guide`; Cursor rule via `./install.sh`).
+(MCP resource `bookkeeper://usage-guide`; Cursor rule via `./install.sh`).
 
 High level: query RAG when prior context is likely relevant, then triage with
 `query_knowledge_base` → `prepare_cloud_context` before large cloud turns (use the
@@ -161,7 +161,7 @@ Each turn becomes a searchable chunk with heuristic tags from file paths and que
 
 ```
 ---
-description: Session memory protocol for agents-rag
+description: Session memory protocol for bookkeeper
 alwaysApply: true
 ---
 
@@ -202,7 +202,7 @@ Optional. Requires Ollama with any model (configure via `OLLAMA_MODEL` env var, 
 
 ## Manual Overrides
 
-`.agents-rag-meta.yaml` in any directory:
+`.bookkeeper-meta.yaml` in any directory:
 
 ```yaml
 files:
@@ -218,8 +218,8 @@ Priority: manual override > LLM > path-based.
 A read-only browser for the knowledge base index. Client-side keyword and tag filtering over all indexed chunks.
 
 ```bash
-agents-rag-web            # http://127.0.0.1:8808
-agents-rag-web --port 9000
+bookkeeper-web            # http://127.0.0.1:8808
+bookkeeper-web --port 9000
 ```
 
 Endpoints:

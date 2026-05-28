@@ -19,9 +19,9 @@ def isolated_paths(tmp_path, monkeypatch):
     touch ~/.cache or ~/Library."""
     cache = tmp_path / "cache"
     logs = cache / "logs"
-    plist = tmp_path / "LaunchAgents" / "com.user.agents-rag.plist"
+    plist = tmp_path / "LaunchAgents" / "com.user.bookkeeper.plist"
     sys_dir = tmp_path / "systemd" / "user"
-    unit = sys_dir / "agents-rag.service"
+    unit = sys_dir / "bookkeeper.service"
 
     monkeypatch.setattr(daemon, "CACHE_DIR", cache)
     monkeypatch.setattr(daemon, "PORT_FILE", cache / "daemon.port")
@@ -80,7 +80,7 @@ def test_install_writes_launchd_plist_on_macos(isolated_paths, monkeypatch):
     assert (host, chosen) == ("127.0.0.1", 12345)
     assert daemon.LAUNCHD_PLIST.exists()
     content = daemon.LAUNCHD_PLIST.read_text()
-    assert "com.user.agents-rag" in content
+    assert "com.user.bookkeeper" in content
     assert "<string>12345</string>" in content
     assert "<string>127.0.0.1</string>" in content
     assert "/tmp/cfg.yaml" in content
@@ -165,7 +165,7 @@ def test_unsupported_platform_raises(monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="HTTP daemon not supported on Windows")
 def test_server_main_starts_http_transport(monkeypatch):
-    """`agents-rag serve --http` must wire through to FastMCP's HTTP transport
+    """`bookkeeper serve --http` must wire through to FastMCP's HTTP transport
     with the host/port the user requested. We mock create_app so the test
     doesn't actually bind a socket."""
     from agents_rag import server

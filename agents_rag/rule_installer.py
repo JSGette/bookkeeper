@@ -16,7 +16,7 @@ def build_rule_content(protocol_path: Path) -> str:
     )
     frontmatter = (
         "---\n"
-        "description: Pre-load context from personal knowledge base via RAG before analysis tasks\n"
+        "description: Pre-load context from bookkeeper knowledge base before analysis tasks\n"
         "alwaysApply: true\n"
         "---\n\n"
     )
@@ -49,14 +49,14 @@ def install_project_rules(config_path: Path, protocol_path: Path, script_dir: Pa
         seen.add(resolved)
         rules_dir = resolved / ".cursor" / "rules"
         rules_dir.mkdir(parents=True, exist_ok=True)
-        dest = rules_dir / "agents-rag.mdc"
+        dest = rules_dir / "bookkeeper.mdc"
         dest.write_text(content, encoding="utf-8")
         installed.append(dest)
     return installed
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Install Cursor project rules for agents-rag")
+    parser = argparse.ArgumentParser(description="Install Cursor project rules for bookkeeper")
     parser.add_argument("config_path")
     parser.add_argument("protocol_path")
     parser.add_argument("script_dir")
@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     if not installed:
         raise SystemExit("No rule targets installed")
 
-    print("  Installed agents-rag.mdc (alwaysApply) to:")
+    print("  Installed bookkeeper.mdc (alwaysApply) to:")
     for path in installed:
         print(f"    {path}")
     print()

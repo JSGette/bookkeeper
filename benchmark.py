@@ -139,9 +139,9 @@ def print_rubric_template(cost: dict) -> None:
 
 def main():
     cache_dir = os.path.expanduser(
-        os.environ.get("AGENTS_RAG_CACHE", "~/.cache/agents-rag")
+        os.environ.get("AGENTS_RAG_CACHE", "~/.cache/bookkeeper")
     )
-    db_path = os.path.join(cache_dir, "agents-rag.db")
+    db_path = os.path.join(cache_dir, "bookkeeper.db")
     conn = init_db(db_path)
 
     searcher = Searcher(conn)

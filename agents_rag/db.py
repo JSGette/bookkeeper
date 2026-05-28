@@ -1,4 +1,4 @@
-"""SQLite storage backend for agents-rag: documents, chunks, vectors, state."""
+"""SQLite storage backend for bookkeeper: documents, chunks, vectors, state."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Shared configuration loading and validation for agents-rag."""
+"""Shared configuration loading and validation for bookkeeper."""
 
 from __future__ import annotations
 

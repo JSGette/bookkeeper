@@ -160,7 +160,7 @@ def test_load_overrides_reads_yaml(tmp_path):
         }
     }
     import yaml
-    (tmp_path / ".agents-rag-meta.yaml").write_text(yaml.dump(meta))
+    (tmp_path / ".bookkeeper-meta.yaml").write_text(yaml.dump(meta))
     overrides = load_overrides(str(tmp_path))
     assert "guide.md" in overrides
     assert overrides["guide.md"]["description"] == "Custom description"
@@ -172,7 +172,7 @@ def test_load_overrides_nested(tmp_path):
     sub.mkdir()
     meta = {"files": {"util.py": {"description": "desc", "tags": ["util"]}}}
     import yaml
-    (sub / ".agents-rag-meta.yaml").write_text(yaml.dump(meta))
+    (sub / ".bookkeeper-meta.yaml").write_text(yaml.dump(meta))
     overrides = load_overrides(str(tmp_path))
     assert "sub/util.py" in overrides
 

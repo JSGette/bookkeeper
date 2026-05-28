@@ -230,17 +230,17 @@ def generate_tags_gemma(text: str, rel_path: str, cache_dir: str, force: bool = 
 
 
 # ---------------------------------------------------------------------------
-# Layer 3: manual overrides from .agents-rag-meta.yaml
+# Layer 3: manual overrides from .bookkeeper-meta.yaml
 # ---------------------------------------------------------------------------
 
 def load_overrides(source_root: str) -> dict[str, dict]:
-    """Load all .agents-rag-meta.yaml files under a source root.
+    """Load all .bookkeeper-meta.yaml files under a source root.
 
     Returns {relative_path: {"description": str, "tags": [str]}}.
     """
     root = Path(os.path.expanduser(source_root))
     overrides: dict[str, dict] = {}
-    for meta_path in root.rglob(".agents-rag-meta.yaml"):
+    for meta_path in root.rglob(".bookkeeper-meta.yaml"):
         try:
             data = yaml.safe_load(meta_path.read_text()) or {}
         except (yaml.YAMLError, OSError):

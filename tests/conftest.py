@@ -1,4 +1,4 @@
-"""Shared fixtures for agents-rag tests."""
+"""Shared fixtures for bookkeeper tests."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def doc_tree(tmp_path: Path) -> Path:
 
         ## Installation
 
-        Run `pip install agents-rag`.
+        Run `pip install bookkeeper`.
 
         ## Configuration
 

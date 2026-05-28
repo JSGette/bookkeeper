@@ -19,22 +19,22 @@ done
 # for the SQLite WAL or hold stale code on the next Cursor restart.
 existing_pids=$(pgrep -f 'agents_rag\.server' || true)
 if [ -n "$existing_pids" ]; then
-    echo "==> Killing existing agents-rag processes: $existing_pids"
+    echo "==> Killing existing bookkeeper processes: $existing_pids"
     echo "$existing_pids" | xargs kill 2>/dev/null || true
     sleep 1
     echo "$existing_pids" | xargs kill -9 2>/dev/null || true
 fi
 
-echo "==> Installing agents-rag from $SCRIPT_DIR"
+echo "==> Installing bookkeeper from $SCRIPT_DIR"
 pip install -e "$SCRIPT_DIR"
 
 if [ "$MODE" = "daemon" ]; then
     echo "==> Installing shared daemon (one process across all Cursor windows)"
     # Install + start the daemon; the helper picks a free port at/after 8765
-    # and persists it to ~/.cache/agents-rag/daemon.port.
-    AGENTS_RAG_CONFIG="$CONFIG_YAML" agents-rag daemon install >/dev/null
-    AGENTS_RAG_CONFIG="$CONFIG_YAML" agents-rag daemon start
-    PORT=$(cat "$HOME/.cache/agents-rag/daemon.port")
+    # and persists it to ~/.cache/bookkeeper/daemon.port.
+    AGENTS_RAG_CONFIG="$CONFIG_YAML" bookkeeper daemon install >/dev/null
+    AGENTS_RAG_CONFIG="$CONFIG_YAML" bookkeeper daemon start
+    PORT=$(cat "$HOME/.cache/bookkeeper/daemon.port")
 
     echo "==> Registering MCP server (HTTP url) in $MCP_JSON"
     mkdir -p "$(dirname "$MCP_JSON")"
@@ -44,9 +44,9 @@ mcp_path = pathlib.Path(os.environ['MCP_JSON'])
 port = int(os.environ['PORT'])
 cfg = json.loads(mcp_path.read_text()) if mcp_path.exists() else {}
 cfg.setdefault('mcpServers', {})
-cfg['mcpServers']['agents-rag'] = {'url': f'http://127.0.0.1:{port}/mcp'}
+cfg['mcpServers']['bookkeeper'] = {'url': f'http://127.0.0.1:{port}/mcp'}
 mcp_path.write_text(json.dumps(cfg, indent=2) + '\n')
-print(f"  agents-rag registered as http://127.0.0.1:{port}/mcp")
+print(f"  bookkeeper registered as http://127.0.0.1:{port}/mcp")
 PYEOF
 else
     echo "==> Registering MCP server (stdio) in $MCP_JSON"
@@ -56,13 +56,13 @@ import json, os, pathlib
 mcp_path = pathlib.Path(os.environ['MCP_JSON'])
 cfg = json.loads(mcp_path.read_text()) if mcp_path.exists() else {}
 cfg.setdefault('mcpServers', {})
-cfg['mcpServers']['agents-rag'] = {
+cfg['mcpServers']['bookkeeper'] = {
     'command': 'python',
     'args': ['-m', 'agents_rag.server'],
     'env': {'AGENTS_RAG_CONFIG': os.environ['CONFIG_YAML']},
 }
 mcp_path.write_text(json.dumps(cfg, indent=2) + '\n')
-print(f"  agents-rag registered (stdio, config: {os.environ['CONFIG_YAML']})")
+print(f"  bookkeeper registered (stdio, config: {os.environ['CONFIG_YAML']})")
 PYEOF
 fi
 
@@ -71,10 +71,10 @@ if [ ! -f "$PROTOCOL" ]; then
     exit 1
 fi
 
-echo "==> Installing Cursor project rules (.cursor/rules/agents-rag.mdc)"
+echo "==> Installing Cursor project rules (.cursor/rules/bookkeeper.mdc)"
 python3 -m agents_rag.rule_installer "$CONFIG_YAML" "$PROTOCOL" "$SCRIPT_DIR"
 
 echo "==> Done. Restart Cursor windows to pick up the MCP server and project rules."
 if [ "$MODE" = "daemon" ]; then
-    echo "    Daemon controls: agents-rag daemon {start|stop|restart|status|logs}"
+    echo "    Daemon controls: bookkeeper daemon {start|stop|restart|status|logs}"
 fi

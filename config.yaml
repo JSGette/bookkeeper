@@ -21,7 +21,7 @@ sources:
 
 sessions:
   transcript_dirs:
-    - ~/.cursor/projects/Users-joseph-gette-REPOS-agents-rag/agent-transcripts
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-bookkeeper/agent-transcripts
     - ~/.cursor/projects/Users-joseph-gette-REPOS-datadog-agent/agent-transcripts
     - ~/.cursor/projects/Users-joseph-gette-REPOS-bazel-conduit/agent-transcripts
     - ~/.cursor/projects/Users-joseph-gette-REPOS-bazel-ui/agent-transcripts
@@ -43,7 +43,7 @@ sessions:
   watch_interval_minutes: 5
 
 model: BAAI/bge-small-en-v1.5
-cache_dir: ~/.cache/agents-rag
+cache_dir: ~/.cache/bookkeeper
 use_gemma: true
 
 # Local LLM profiles (Ollama). fast = Gemma; code = Qwen3-Coder 30B.

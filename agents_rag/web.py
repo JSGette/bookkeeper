@@ -1,4 +1,4 @@
-"""Lightweight HTTP server for the agents-rag knowledge base browser."""
+"""Lightweight HTTP server for the bookkeeper knowledge base browser."""
 
 from __future__ import annotations
 
@@ -105,13 +105,13 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="agents-rag web UI")
+    parser = argparse.ArgumentParser(description="bookkeeper web UI")
     parser.add_argument("--port", type=int, default=int(os.environ.get("AGENTS_RAG_WEB_PORT", "8808")))
     args = parser.parse_args()
 
     config = load_config()
-    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/agents-rag"))
-    Handler.db_path = os.path.join(cache_dir, "agents-rag.db")
+    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/bookkeeper"))
+    Handler.db_path = os.path.join(cache_dir, "bookkeeper.db")
 
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     log.info("Serving on http://127.0.0.1:%d  (db=%s)", args.port, Handler.db_path)

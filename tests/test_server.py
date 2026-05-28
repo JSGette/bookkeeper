@@ -112,7 +112,7 @@ def test_create_app_registers_tools(mock_s, mock_i, tmp_path):
     from agents_rag.server import create_app
     import asyncio
     mcp = create_app(config_override=config)
-    assert mcp.name == "agents-rag"
+    assert mcp.name == "bookkeeper"
     tools = asyncio.run(mcp.list_tools())
     tool_names = {t.name for t in tools}
     expected = {
@@ -166,7 +166,7 @@ def server_env(tmp_path):
 
     cache_dir = str(tmp_path / "cache")
     os.makedirs(cache_dir, exist_ok=True)
-    db_path = os.path.join(cache_dir, "agents-rag.db")
+    db_path = os.path.join(cache_dir, "bookkeeper.db")
     conn = db.init_db(db_path)
     sources = parse_sources(config)
     reindex_all(sources, conn, use_gemma=False)
@@ -426,7 +426,7 @@ def _build_app(tmp_path, extra_config: dict | None = None):
     os.makedirs(cache_dir, exist_ok=True)
     # Pre-index so search has data before the first query.
     from agents_rag import db
-    conn = db.init_db(os.path.join(cache_dir, "agents-rag.db"))
+    conn = db.init_db(os.path.join(cache_dir, "bookkeeper.db"))
     reindex_all(parse_sources(config), conn, use_gemma=False)
     conn.close()
     return create_app(config_override=config)
