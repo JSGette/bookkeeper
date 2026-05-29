@@ -1,4 +1,4 @@
-"""Ollama chat client with fast (Gemma) and code (Qwen3-Coder) profiles."""
+"""Ollama chat client with fast/code profiles (Qwen-capable defaults)."""
 
 from __future__ import annotations
 
@@ -52,11 +52,12 @@ class ModelProfile:
 
 _DEFAULT_PROFILES: dict[str, ModelProfile] = {
     "fast": ModelProfile(
-        name=os.environ.get("OLLAMA_MODEL_FAST", "gemma4:e4b"),
-        max_input_chars=30_000,
-        timeout_s=float(os.environ.get("OLLAMA_TIMEOUT", "120")),
-        keep_alive=_parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "5m")),
-        num_predict=2048,
+        name=os.environ.get("OLLAMA_MODEL_FAST", "qwen3-coder:30b"),
+        max_input_chars=80_000,
+        timeout_s=float(os.environ.get("OLLAMA_TIMEOUT", "300")),
+        keep_alive=_parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "30m")),
+        num_predict=4096,
+        num_ctx=32_768,
     ),
     "code": ModelProfile(
         name=os.environ.get("OLLAMA_MODEL_CODE", "qwen3-coder:30b"),

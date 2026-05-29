@@ -66,6 +66,26 @@ def parse_turns_jsonl(text: str, start_offset: int = 0) -> list[Turn]:
             cur.assistant_text = "\n".join(cur_assistant_parts)[:2000]
             turns.append(cur)
 
+    def _iter_content_blocks(raw_content: object) -> list[dict]:
+        # Cursor JSONL can contain legacy/malformed content shapes; treat unknown
+        # entries as text so one bad event does not kill the whole watcher tick.
+        if isinstance(raw_content, list):
+            items = raw_content
+        elif isinstance(raw_content, dict):
+            items = [raw_content]
+        elif isinstance(raw_content, str):
+            items = [{"type": "text", "text": raw_content}]
+        else:
+            return []
+
+        blocks: list[dict] = []
+        for item in items:
+            if isinstance(item, dict):
+                blocks.append(item)
+            elif isinstance(item, str):
+                blocks.append({"type": "text", "text": item})
+        return blocks
+
     for raw_line in text.splitlines(keepends=True):
         line_len = len(raw_line)
         stripped = raw_line.strip()
@@ -79,7 +99,7 @@ def parse_turns_jsonl(text: str, start_offset: int = 0) -> list[Turn]:
             continue
 
         role = event.get("role")
-        content = (event.get("message") or {}).get("content") or []
+        content = _iter_content_blocks((event.get("message") or {}).get("content"))
 
         if role == "user":
             user_text = "\n".join(
@@ -107,10 +127,15 @@ def parse_turns_jsonl(text: str, start_offset: int = 0) -> list[Turn]:
                         cur_assistant_parts.append(txt)
                 elif t == "tool_use":
                     name = b.get("name") or ""
-                    inp = b.get("input") or {}
+                    inp = b.get("input")
+                    if isinstance(inp, dict):
+                        p = inp.get("path")
+                    elif isinstance(inp, str):
+                        p = inp
+                    else:
+                        p = None
                     if name and name not in cur.tools_called:
                         cur.tools_called.append(name)
-                    p = inp.get("path")
                     if isinstance(p, str) and p:
                         if name in ("Read", "Glob", "Grep") and p not in cur.files_read:
                             cur.files_read.append(p)

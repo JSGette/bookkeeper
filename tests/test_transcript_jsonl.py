@@ -103,6 +103,37 @@ def test_parse_incremental_offset():
     assert turns[0].byte_offset >= first_len
 
 
+def test_parse_handles_string_content_blocks():
+    content = (
+        json.dumps({
+            "role": "user",
+            "message": {"content": "<user_query>\ntrack parser crash\n</user_query>"},
+        }) + "\n"
+        + json.dumps({
+            "role": "assistant",
+            "message": {"content": "Handled malformed content safely."},
+        }) + "\n"
+    )
+    turns = parse_turns_jsonl(content)
+    assert len(turns) == 1
+    assert turns[0].user_query == "track parser crash"
+    assert "Handled malformed content safely." in turns[0].assistant_text
+
+
+def test_parse_tool_use_input_string_path():
+    content = (
+        _user("<user_query>\ntrack file reads\n</user_query>")
+        + _assistant([
+            {"type": "tool_use", "name": "Read", "input": "/tmp/path.txt"},
+            {"type": "tool_use", "name": "Write", "input": "/tmp/out.txt"},
+        ])
+    )
+    turns = parse_turns_jsonl(content)
+    assert len(turns) == 1
+    assert "/tmp/path.txt" in turns[0].files_read
+    assert "/tmp/out.txt" in turns[0].files_edited
+
+
 # ---------------------------------------------------------------------------
 # distill_transcript + walker (.jsonl path, subagents excluded)
 # ---------------------------------------------------------------------------
