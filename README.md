@@ -51,8 +51,7 @@ pip install -e .
 
 # Optional extras:
 pip install -e ".[code]"   # treesitter-chunker for AST-aware code chunking
-pip install -e ".[perf]"   # hnswlib for ANN search on large corpora
-pip install -e ".[all]"    # both
+pip install -e ".[all]"    # includes treesitter-chunker
 ```
 
 Install the shared daemon and register it in `~/.cursor/mcp.json`:
@@ -179,16 +178,16 @@ starting context instead of re-scanning the codebase.
 
 ## Hybrid Search
 
-Two retrieval paths fused via Reciprocal Rank Fusion (RRF, k=60):
+Two retrieval paths fused via Reciprocal Rank Fusion (RRF, default k=10):
 
 1. **BM25** — keyword matching via `rank-bm25`
 2. **Vector cosine** — semantic matching via `BAAI/bge-small-en-v1.5` (configurable via `EMBEDDING_MODEL` env var)
 
-Post-fusion: score-gap filtering (configurable z-score threshold, default 0.8σ) removes noise while guaranteeing at least `min_results` (default 2). Freshness boost (time-decay over ~1 week) promotes recent docs. For corpora >5000 chunks, optional `hnswlib` provides sub-ms ANN search.
+Post-fusion: score-gap filtering (configurable z-score threshold, default 0.8σ) removes noise while guaranteeing at least `min_results` (default 2). Freshness boost (time-decay over ~1 week) promotes recent docs. `hnswlib` is used for ANN-backed vector retrieval.
 
 ## LLM Tagging
 
-Optional. Requires Ollama with any model (configure via `OLLAMA_MODEL` env var, default `gemma4:e4b`).
+Optional. Requires Ollama with any model. By default, bookkeeper uses profile-based models (`OLLAMA_MODEL_FAST` / `OLLAMA_MODEL_CODE`, default `qwen3-coder:30b` for both). Legacy single-model fallback via `OLLAMA_MODEL` is still supported.
 
 - Tag cache is **content-aware** — file changes invalidate automatically
 - System prompt and few-shot examples are configurable via `tagger_prompt` / `tagger_examples`
@@ -245,5 +244,5 @@ The UI loads all metadata client-side and filters by keyword (path, title, headi
 | `pyyaml` | Config parsing |
 | `tiktoken` | Token counting |
 
-**Optional:** `treesitter-chunker` (code chunking), `hnswlib` (ANN search).
+**Optional:** `treesitter-chunker` (code chunking).
 **Runtime:** Ollama with an LLM (for semantic tagging, document summarization, and transcript distillation).
