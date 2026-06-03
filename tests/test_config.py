@@ -45,6 +45,7 @@ def test_parse_sources_with_defaults(tmp_path):
     assert len(sources) == 1
     s = sources[0]
     assert s.name == "t"
+    assert s.index_enabled is True
     assert s.file_types == [".md"]
     assert s.max_chunk_tokens == 512
 
@@ -52,12 +53,14 @@ def test_parse_sources_with_defaults(tmp_path):
 def test_parse_sources_with_overrides(tmp_path):
     config = {"sources": [{
         "name": "t", "path": str(tmp_path),
+        "index_enabled": False,
         "file_types": [".go", ".py"], "max_chunk_tokens": 1024,
         "skip": ["vendor/*"], "min_lines": 10,
     }]}
     sources = parse_sources(config)
     s = sources[0]
     assert s.file_types == [".go", ".py"]
+    assert s.index_enabled is False
     assert s.max_chunk_tokens == 1024
     assert s.skip == ["vendor/*"]
     assert s.min_lines == 10

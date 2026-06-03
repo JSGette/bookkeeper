@@ -234,3 +234,5 @@ def test_reindex_all_with_filter(mock_embed, doc_tree, tmp_path):
     )
     doc_sources = {m["source"] for m in meta}
     assert "docs" in doc_sources
+
+

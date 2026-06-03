@@ -409,6 +409,9 @@ def reindex_all(
     for src in sources:
         if source_filter and src.name != source_filter:
             continue
+        if not src.index_enabled:
+            log.info("Skipping source %s: indexing disabled by config", src.name)
+            continue
         reindex_source(src, conn, use_gemma=use_gemma)
 
     # Load the full merged state from DB

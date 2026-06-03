@@ -55,6 +55,7 @@ def test_parse_sources_basic(tmp_path):
     result = parse_sources({"sources": [src]})
     assert len(result) == 1
     assert result[0].name == "t"
+    assert result[0].index_enabled is True
 
 
 def test_load_config_from_env(tmp_path):

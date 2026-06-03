@@ -13,7 +13,7 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-_write_lock = threading.Lock()
+_write_lock = threading.RLock()
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS documents (
@@ -164,23 +164,26 @@ def upsert_document(
 
 
 def get_document_id(conn: sqlite3.Connection, source: str, path: str) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM documents WHERE source=? AND path=?", (source, path),
-    ).fetchone()
+    with _write_lock:
+        row = conn.execute(
+            "SELECT id FROM documents WHERE source=? AND path=?", (source, path),
+        ).fetchone()
     return row[0] if row else None
 
 
 def get_document_content(conn: sqlite3.Connection, source: str, path: str) -> str | None:
-    row = conn.execute(
-        "SELECT content FROM documents WHERE source=? AND path=?", (source, path),
-    ).fetchone()
+    with _write_lock:
+        row = conn.execute(
+            "SELECT content FROM documents WHERE source=? AND path=?", (source, path),
+        ).fetchone()
     return row[0] if row else None
 
 
 def get_document_summary(conn: sqlite3.Connection, source: str, path: str) -> str | None:
-    row = conn.execute(
-        "SELECT summary FROM documents WHERE source=? AND path=?", (source, path),
-    ).fetchone()
+    with _write_lock:
+        row = conn.execute(
+            "SELECT summary FROM documents WHERE source=? AND path=?", (source, path),
+        ).fetchone()
     return row[0] if row else None
 
 
@@ -277,17 +280,18 @@ def load_all_chunks(
             c.doc_preamble, c.indexed_at, c.vector,
             c.session_summary, c.full_session_path, c.session_turn_count,
             d.summary"""
-    if source:
-        rows = conn.execute(
-            f"SELECT {_cols} FROM chunks c JOIN documents d ON c.doc_id = d.id"
-            " WHERE d.source = ? ORDER BY c.id",
-            (source,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT {_cols} FROM chunks c JOIN documents d ON c.doc_id = d.id"
-            " ORDER BY c.id",
-        ).fetchall()
+    with _write_lock:
+        if source:
+            rows = conn.execute(
+                f"SELECT {_cols} FROM chunks c JOIN documents d ON c.doc_id = d.id"
+                " WHERE d.source = ? ORDER BY c.id",
+                (source,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {_cols} FROM chunks c JOIN documents d ON c.doc_id = d.id"
+                " ORDER BY c.id",
+            ).fetchall()
 
     metadata: list[dict] = []
     vectors: list[np.ndarray] = []
@@ -326,7 +330,8 @@ def load_all_chunks(
 
 
 def chunk_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+    with _write_lock:
+        row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
     return row[0] if row else 0
 
 
@@ -335,7 +340,8 @@ def chunk_count(conn: sqlite3.Connection) -> int:
 # ---------------------------------------------------------------------------
 
 def load_hnsw_cache(conn: sqlite3.Connection) -> tuple[bytes, int] | None:
-    row = conn.execute("SELECT data, chunk_count FROM hnsw_cache WHERE id=1").fetchone()
+    with _write_lock:
+        row = conn.execute("SELECT data, chunk_count FROM hnsw_cache WHERE id=1").fetchone()
     if row is None:
         return None
     return row[0], row[1]
@@ -360,10 +366,11 @@ def save_hnsw_cache(conn: sqlite3.Connection, data: bytes, num_chunks: int) -> N
 # ---------------------------------------------------------------------------
 
 def load_source_state(conn: sqlite3.Connection, source_name: str) -> dict:
-    row = conn.execute(
-        "SELECT commit_hash, mtimes, indexed_at FROM source_state WHERE source_name=?",
-        (source_name,),
-    ).fetchone()
+    with _write_lock:
+        row = conn.execute(
+            "SELECT commit_hash, mtimes, indexed_at FROM source_state WHERE source_name=?",
+            (source_name,),
+        ).fetchone()
     if row is None:
         return {}
     state: dict = {}
@@ -400,7 +407,8 @@ def save_source_state(conn: sqlite3.Connection, source_name: str, state: dict) -
 
 def load_all_source_state(conn: sqlite3.Connection) -> dict[str, dict]:
     """Load state for all sources, keyed by source name."""
-    rows = conn.execute("SELECT source_name, commit_hash, mtimes, indexed_at FROM source_state").fetchall()
+    with _write_lock:
+        rows = conn.execute("SELECT source_name, commit_hash, mtimes, indexed_at FROM source_state").fetchall()
     result: dict[str, dict] = {}
     for name, commit, mtimes_json, indexed_at in rows:
         state: dict = {}
@@ -422,7 +430,8 @@ def load_all_source_state(conn: sqlite3.Connection) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def load_deprecated(conn: sqlite3.Connection) -> dict[str, str]:
-    rows = conn.execute("SELECT path, reason FROM deprecated").fetchall()
+    with _write_lock:
+        rows = conn.execute("SELECT path, reason FROM deprecated").fetchall()
     return dict(rows)
 
 
@@ -450,9 +459,10 @@ def remove_deprecated(conn: sqlite3.Connection, path: str) -> bool:
 def load_transcript_state(conn: sqlite3.Connection, transcript_path: str) -> dict:
     import hashlib
     h = hashlib.sha256(transcript_path.encode()).hexdigest()[:16]
-    row = conn.execute(
-        "SELECT state_json FROM transcript_state WHERE transcript_hash=?", (h,),
-    ).fetchone()
+    with _write_lock:
+        row = conn.execute(
+            "SELECT state_json FROM transcript_state WHERE transcript_hash=?", (h,),
+        ).fetchone()
     if row is None:
         return {}
     try:
@@ -504,17 +514,20 @@ def log_query(
              1 if reranker_used else 0, rrf_k, score_kind, query_embedding),
         )
         conn.commit()
-        return cur.lastrowid
+        row_id = cur.lastrowid
+        assert row_id is not None
+        return row_id
 
 
 def get_recent_queries(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
-    rows = conn.execute(
-        """SELECT id, timestamp, query, source_filter, top_k,
-                  result_count, results_json, latency_ms,
-                  reranker_used, rrf_k, score_kind
-           FROM query_log ORDER BY id DESC LIMIT ?""",
-        (limit,),
-    ).fetchall()
+    with _write_lock:
+        rows = conn.execute(
+            """SELECT id, timestamp, query, source_filter, top_k,
+                      result_count, results_json, latency_ms,
+                      reranker_used, rrf_k, score_kind
+               FROM query_log ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
     return [
         {
             "id": r[0], "timestamp": r[1], "query": r[2],
@@ -541,30 +554,31 @@ def get_recent_query_embeddings(
     cutoff = time.strftime(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - since_seconds),
     )
-    if source_filter is None:
-        rows = conn.execute(
-            """SELECT id, timestamp, query, results_json, query_embedding,
-                      reranker_used, rrf_k, score_kind
-               FROM query_log
-               WHERE source_filter IS NULL
-                 AND timestamp >= ?
-                 AND query_embedding IS NOT NULL
-                 AND score_kind != 'cached'
-               ORDER BY id DESC LIMIT ?""",
-            (cutoff, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT id, timestamp, query, results_json, query_embedding,
-                      reranker_used, rrf_k, score_kind
-               FROM query_log
-               WHERE source_filter = ?
-                 AND timestamp >= ?
-                 AND query_embedding IS NOT NULL
-                 AND score_kind != 'cached'
-               ORDER BY id DESC LIMIT ?""",
-            (source_filter, cutoff, limit),
-        ).fetchall()
+    with _write_lock:
+        if source_filter is None:
+            rows = conn.execute(
+                """SELECT id, timestamp, query, results_json, query_embedding,
+                          reranker_used, rrf_k, score_kind
+                   FROM query_log
+                   WHERE source_filter IS NULL
+                     AND timestamp >= ?
+                     AND query_embedding IS NOT NULL
+                     AND score_kind != 'cached'
+                   ORDER BY id DESC LIMIT ?""",
+                (cutoff, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, timestamp, query, results_json, query_embedding,
+                          reranker_used, rrf_k, score_kind
+                   FROM query_log
+                   WHERE source_filter = ?
+                     AND timestamp >= ?
+                     AND query_embedding IS NOT NULL
+                     AND score_kind != 'cached'
+                   ORDER BY id DESC LIMIT ?""",
+                (source_filter, cutoff, limit),
+            ).fetchall()
     return [
         {
             "id": r[0], "timestamp": r[1], "query": r[2],
@@ -584,13 +598,13 @@ def gc_source(conn: sqlite3.Connection, source: str, live_paths: set[str]) -> in
 
     Returns number of documents removed.
     """
-    rows = conn.execute(
-        "SELECT id, path FROM documents WHERE source=?", (source,),
-    ).fetchall()
-    stale_ids = [doc_id for doc_id, path in rows if path not in live_paths]
-    if not stale_ids:
-        return 0
     with _write_lock:
+        rows = conn.execute(
+            "SELECT id, path FROM documents WHERE source=?", (source,),
+        ).fetchall()
+        stale_ids = [doc_id for doc_id, path in rows if path not in live_paths]
+        if not stale_ids:
+            return 0
         placeholders = ",".join("?" * len(stale_ids))
         conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", stale_ids)
         conn.commit()

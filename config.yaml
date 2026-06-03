@@ -8,6 +8,7 @@ sources:
 
   - name: repo
     path: ~/REPOS/datadog-agent
+    index_enabled: false
     file_types: [.md, .go, .py, .bzl, .bazel]
     skip:
       - "docs/cloud-workload-security/*"
@@ -21,6 +22,7 @@ sources:
 
 sessions:
   transcript_dirs:
+    - ~/.cursor/projects/Users-joseph-gette-REPOS-agents-rag/agent-transcripts
     - ~/.cursor/projects/Users-joseph-gette-REPOS-bookkeeper/agent-transcripts
     - ~/.cursor/projects/Users-joseph-gette-REPOS-datadog-agent/agent-transcripts
     - ~/.cursor/projects/Users-joseph-gette-REPOS-bazel-conduit/agent-transcripts
@@ -46,16 +48,18 @@ model: BAAI/bge-small-en-v1.5
 cache_dir: ~/.cache/bookkeeper
 use_gemma: true
 
-# Local LLM profiles (Ollama). fast = Gemma; code = Qwen3-Coder 30B.
+# Local LLM profiles (Ollama). Qwen-only: both fast and code use qwen3-coder:30b.
 ollama:
   url: http://127.0.0.1:11434
   models:
     fast:
-      name: gemma4:e4b
-      max_input_chars: 30000
-      timeout_s: 120
-      keep_alive: 5m
-      num_predict: 2048
+      name: qwen3-coder:30b
+      max_input_chars: 80000
+      timeout_s: 300
+      keep_alive: 30m
+      num_predict: 4096
+      options:
+        num_ctx: 32768
     code:
       name: qwen3-coder:30b
       max_input_chars: 80000

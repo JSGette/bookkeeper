@@ -25,6 +25,13 @@ bookkeeper-web = "agents_rag.web:main"
 agents-rag = "agents_rag.server:main"
 agents-rag-web = "agents_rag.web:main"
 
+[tool.setuptools.packages.find]
+include = ["agents_rag*"]
+exclude = ["eval*", "tests*", "docs*"]
+
+[tool.setuptools.package-data]
+agents_rag = ["static/*.html"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

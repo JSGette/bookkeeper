@@ -56,6 +56,7 @@ def parse_sources(config: dict) -> list[SourceConfig]:
         sources.append(SourceConfig(
             name=s["name"],
             path=os.path.expanduser(s["path"]),
+            index_enabled=bool(s.get("index_enabled", True)),
             skip=s.get("skip", []),
             min_lines=s.get("min_lines", 0),
             generate_index=s.get("generate_index", False),

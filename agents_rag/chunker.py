@@ -52,6 +52,7 @@ _DEFAULT_MAX_WHOLE_DOC_TOKENS = 1500
 class SourceConfig:
     name: str
     path: str
+    index_enabled: bool = True
     skip: list[str] = field(default_factory=list)
     min_lines: int = 0
     generate_index: bool = False

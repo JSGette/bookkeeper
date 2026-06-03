@@ -115,6 +115,10 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     reranker_pool_multiplier = int(reranker_config.get("pool_multiplier", 6))
 
     conn = db.init_db(db_path)
+    for src in sources:
+        if not src.index_enabled:
+            db.delete_source_documents(conn, src.name)
+            log.info("Purged indexed documents for disabled source: %s", src.name)
     read_conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     read_conn.execute("PRAGMA busy_timeout=30000")
     read_conn.execute("PRAGMA foreign_keys=ON")
@@ -523,6 +527,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             result.append({
                 "name": src.name,
                 "path": src.path,
+                "index_enabled": src.index_enabled,
                 "file_count": file_count,
                 "chunk_count": chunk_count,
             })
@@ -709,6 +714,7 @@ def create_app(config_override: dict | None = None) -> FastMCP:
             "chunk_count": searcher.chunk_count,
             "source_stats": searcher.source_stats(),
             "sources_configured": [s.name for s in sources],
+            "index_enabled_sources": [s.name for s in sources if s.index_enabled],
             "transcript_dirs": len(transcript_dirs),
         }
         with _reindex_lock:

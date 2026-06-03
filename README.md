@@ -101,6 +101,7 @@ sources:
 
   - name: repo
     path: ~/my-project
+    index_enabled: false          # optional (default true); disable for always-live repos
     file_types: [.md, .go, .py, .bzl]
     skip:
       - "vendor/*"
@@ -133,6 +134,7 @@ use_gemma: true
 ### Source handling
 
 - Each configured source is indexed independently into one shared vector index
+- Set `index_enabled: false` on a source to keep it configured but exclude it from indexing
 - `sessions` is a special source created by the transcript watcher / `save_session` tool
 - `reindex()` rebuilds configured sources but preserves session chunks
 - Queries can filter by source name or search across all sources

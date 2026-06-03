@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from agents_rag.db import (
@@ -195,3 +197,28 @@ def test_query_log_roundtrip(tmp_db):
     assert entries[0]["latency_ms"] == 10
     assert entries[1]["query"] == "test query"
     assert entries[1]["result_count"] == 2
+
+
+def test_shared_connection_concurrent_reads_and_writes(tmp_db):
+    errors: list[BaseException] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            for i in range(20):
+                path = f"{worker_id}-{i}.md"
+                doc_id = upsert_document(tmp_db, "src", path, "", "", "content")
+                vecs = np.ones((1, 384), dtype=np.float32)
+                upsert_chunks(tmp_db, doc_id, [{"text": path}], vecs)
+                load_all_chunks(tmp_db)
+                chunk_count(tmp_db)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert tmp_db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
