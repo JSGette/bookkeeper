@@ -12,6 +12,7 @@ returns None and callers fall back to the RRF ordering.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 
@@ -39,8 +40,18 @@ def _get_reranker(model_name: str):
             return None
         try:
             from sentence_transformers import CrossEncoder
+            from torch import nn
+
             log.info("Loading cross-encoder reranker: %s", model_name)
-            _model = CrossEncoder(model_name)
+            # Select the explicit activation on both supported API generations.
+            # Otherwise saved model defaults can return either logits or scores,
+            # and applying a second sigmoid makes weak matches look relevant.
+            activation_parameter = (
+                "activation_fn"
+                if "activation_fn" in inspect.signature(CrossEncoder).parameters
+                else "default_activation_function"
+            )
+            _model = CrossEncoder(model_name, **{activation_parameter: nn.Sigmoid()})
             _model_name_loaded = model_name
             return _model
         except Exception as exc:
@@ -51,16 +62,15 @@ def _get_reranker(model_name: str):
             return None
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
 def rerank(
     query: str,
     passages: list[str],
     model_name: str = "BAAI/bge-reranker-base",
 ) -> np.ndarray | None:
-    """Score (query, passage) pairs in [0, 1]. Returns None if reranker unavailable."""
+    """Return sigmoid-normalized relevance scores, or None if unavailable.
+
+    Scores are in [0, 1]; they are not calibrated relevance probabilities.
+    """
     if not passages:
         return np.array([], dtype=np.float32)
     model = _get_reranker(model_name)
@@ -68,8 +78,13 @@ def rerank(
         return None
     try:
         pairs = [(query, p) for p in passages]
-        raw = model.predict(pairs, show_progress_bar=False, convert_to_numpy=True)
-        return _sigmoid(np.asarray(raw, dtype=np.float32))
+        predictions = model.predict(pairs, show_progress_bar=False, convert_to_numpy=True)
+        scores = np.asarray(predictions, dtype=np.float32)
+        if scores.shape != (len(passages),):
+            raise ValueError("Expected one relevance score per passage")
+        if not np.all(np.isfinite(scores) & (scores >= 0.0) & (scores <= 1.0)):
+            raise ValueError("Expected finite relevance scores in [0, 1]")
+        return scores
     except Exception as exc:
         log.warning("Reranker predict failed: %s", exc)
         return None

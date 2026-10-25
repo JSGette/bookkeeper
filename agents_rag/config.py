@@ -65,3 +65,22 @@ def parse_sources(config: dict) -> list[SourceConfig]:
             max_whole_doc_tokens=s.get("max_whole_doc_tokens", 1500),
         ))
     return sources
+
+
+def resolve_database_path(config: dict) -> str:
+    """Honor explicit selection and never silently replace a legacy database with an empty one."""
+    if config.get("db_path"):
+        return str(Path(config["db_path"]).expanduser().resolve())
+    cache = Path(config.get("cache_dir", "~/.cache/bookkeeper")).expanduser().resolve()
+    target = cache / "bookkeeper.db"
+    if target.exists():
+        return str(target)
+    candidates = [cache / "agents-rag.db"]
+    if cache == Path("~/.cache/bookkeeper").expanduser().resolve():
+        candidates.extend([Path("~/.cache/agents-rag/agents-rag.db").expanduser(),
+                           Path("~/.cache/agents-rag/bookkeeper.db").expanduser()])
+    legacy = [str(p) for p in candidates if p.is_file()]
+    if legacy or (cache / "chunks.json").exists() or (cache / "index.npz").exists():
+        raise ValueError("Legacy data found; select db_path explicitly or run bookkeeper migrate "
+                         "--from SOURCE --to DESTINATION before starting. Candidates: " + ", ".join(legacy or [str(cache)]))
+    return str(target)

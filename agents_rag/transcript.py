@@ -86,8 +86,10 @@ def parse_turns_jsonl(text: str, start_offset: int = 0) -> list[Turn]:
                 blocks.append({"type": "text", "text": item})
         return blocks
 
-    for raw_line in text.splitlines(keepends=True):
-        line_len = len(raw_line)
+    # JSONL delimiters are LF bytes; Unicode separators inside JSON strings
+    # (which str.splitlines also splits) are ordinary evidence characters.
+    for raw_line in text.split("\n"):
+        line_len = len(raw_line.encode("utf-8")) + 1
         stripped = raw_line.strip()
         if not stripped:
             running_offset += line_len
@@ -98,8 +100,12 @@ def parse_turns_jsonl(text: str, start_offset: int = 0) -> list[Turn]:
             running_offset += line_len
             continue
 
+        if not isinstance(event, dict):
+            running_offset += line_len
+            continue
         role = event.get("role")
-        content = _iter_content_blocks((event.get("message") or {}).get("content"))
+        message = event.get("message")
+        content = _iter_content_blocks(message.get("content") if isinstance(message, dict) else None)
 
         if role == "user":
             user_text = "\n".join(
@@ -154,19 +160,17 @@ def parse_turns(text: str, start_offset: int = 0) -> list[Turn]:
     Legacy text-dump format (pre-JSONL Cursor transcripts). Kept as a fallback
     for old projects; current Cursor transcripts are JSONL — see ``parse_turns_jsonl``.
     """
-    blocks = re.split(r"^user:\s*$", text, flags=re.MULTILINE)
+    boundaries = [0, *(m.start() for m in re.finditer(r"^user:\s*$", text, re.MULTILINE)), len(text)]
     turns: list[Turn] = []
     running_offset = start_offset
 
-    for i, block in enumerate(blocks):
-        if i == 0 and not block.strip():
-            running_offset += len(block) + len("user:\n")
-            continue
-
+    for start, end in zip(boundaries, boundaries[1:]):
+        block = text[start:end]
+        block_offset = running_offset
+        running_offset += len(block.encode("utf-8"))
         query_match = re.search(r"<user_query>\s*(.*?)\s*</user_query>", block, re.DOTALL)
         user_query = query_match.group(1).strip() if query_match else ""
         if not user_query:
-            running_offset += len(block) + len("user:\n")
             continue
 
         assistant_parts = []
@@ -207,9 +211,8 @@ def parse_turns(text: str, start_offset: int = 0) -> list[Turn]:
             files_read=list(dict.fromkeys(files_read)),
             files_edited=list(dict.fromkeys(files_edited)),
             tools_called=list(dict.fromkeys(tools_called)),
-            byte_offset=running_offset,
+            byte_offset=block_offset,
         ))
-        running_offset += len(block) + len("user:\n")
 
     return turns
 
@@ -256,9 +259,9 @@ def write_summary_file(
     p.parent.mkdir(parents=True, exist_ok=True)
 
     if append and p.exists():
-        existing = p.read_text()
+        existing = p.read_text(encoding="utf-8")
         new_turns = "\n".join(_turn_to_markdown(t) for t in turns)
-        p.write_text(existing + "\n" + new_turns)
+        p.write_text(existing + "\n" + new_turns, encoding="utf-8")
     else:
         parts = [
             f"# {title}",
@@ -287,7 +290,7 @@ def write_summary_file(
         for turn in turns:
             parts.append(_turn_to_markdown(turn))
 
-        p.write_text("\n".join(parts))
+        p.write_text("\n".join(parts), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -468,68 +471,88 @@ def _format_session_summary(gemma_summary: dict) -> str:
 # Incremental distillation orchestrator
 # ---------------------------------------------------------------------------
 
+def _complete_transcript_bytes(raw: bytes, *, jsonl: bool) -> bytes:
+    """Return the complete UTF-8/JSONL prefix, leaving an unfinished tail unread.
+
+    Malformed newline-terminated JSON records remain in the raw evidence even
+    though the parser ignores them. An unterminated record must parse before
+    its bytes can be checkpointed. Invalid UTF-8 is never replaced with U+FFFD.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason != "unexpected end of data":
+            raise
+        raw = raw[:exc.start]
+        text = raw.decode("utf-8")
+    if jsonl and text and not text.endswith("\n"):
+        last_newline = raw.rfind(b"\n") + 1
+        tail = raw[last_newline:]
+        try:
+            json.loads(tail)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raw = raw[:last_newline]
+    return raw
+
+
 def distill_transcript(
     transcript_path: str,
     conn: sqlite3.Connection,
     output_dir: str,
     gemma_every_n: int = 3,
     use_gemma: bool = True,
+    *,
+    save_state: bool = True,
 ) -> list[dict]:
-    """Incrementally distill a single transcript file. Returns new chunk metadata dicts."""
+    """Refresh a changed session, including assistant-only appends.
+
+    The hash and cursor cover complete raw bytes. Reparse that prefix on change
+    so a pending turn, file truncation, or rewrite cannot strand old evidence.
+    With ``save_state=False``, the caller must persist ``transcript_state`` from
+    the returned chunk together with its document/index update.
+    """
     p = Path(transcript_path)
     if not p.exists():
         return []
 
     state = db_mod.load_transcript_state(conn, transcript_path)
-    turns_processed = state.get("turns_processed", 0)
     byte_offset = state.get("byte_offset", 0)
     summary_path = state.get("summary_path", "")
     gemma_summary_turn = state.get("gemma_summary_turn", 0)
 
     try:
-        content = p.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        raw = _complete_transcript_bytes(p.read_bytes(), jsonl=p.suffix == ".jsonl")
+    except (OSError, UnicodeDecodeError):
+        log.warning("Could not read a complete UTF-8 transcript: %s", transcript_path)
         return []
-
-    if byte_offset > 0 and byte_offset < len(content):
-        new_content = content[byte_offset:]
-    elif byte_offset == 0:
-        new_content = content
-    else:
+    if not raw:
         return []
-
+    content_hash = hashlib.sha256(raw).hexdigest()
+    if state.get("content_hash") == content_hash:
+        return []
+    content = raw.decode("utf-8")
     parser = parse_turns_jsonl if p.suffix == ".jsonl" else parse_turns
-
-    new_turns = parser(new_content, byte_offset)
-    if not new_turns:
-        db_mod.save_transcript_state(conn, transcript_path, {
-            **state,
-            "byte_offset": len(content),
-        })
-        return []
-
-    for i, t in enumerate(new_turns):
-        t.index = turns_processed + i
-
-    transcript_id = p.stem
-
-    if turns_processed == 0 and new_turns:
-        title = new_turns[0].user_query
-        if not summary_path:
-            summary_path = _generate_summary_path(output_dir, transcript_id, title)
-    else:
-        title = state.get("title", "Untitled Session")
-
-    # Re-parse the full transcript so the session chunk always reflects every turn,
-    # not just the new ones. The chunk is upserted per call.
     all_turns = parser(content)
-    for i, t in enumerate(all_turns):
-        t.index = i
+    if not all_turns:
+        return []
+    transcript_id = p.stem
+    title = all_turns[0].user_query
+    if not summary_path:
+        summary_path = _generate_summary_path(output_dir, transcript_id, title)
     total_turns = len(all_turns)
 
     gemma_summary = None
     transcript_tags: list[str] = state.get("transcript_tags", [])
     session_summary_text: str = state.get("gemma_summary_text", "")
+
+    # Summaries of a replaced/truncated file cannot describe the new session.
+    # Legacy states lack a byte hash; re-read them once to repair old char cursors.
+    previous_hash = state.get("content_hash")
+    if (not previous_hash or len(raw) < byte_offset
+            or hashlib.sha256(raw[:byte_offset]).hexdigest() != previous_hash):
+        transcript_tags = []
+        session_summary_text = ""
+        gemma_summary_turn = 0
 
     if use_gemma and (total_turns - gemma_summary_turn) >= gemma_every_n:
         gemma_summary = summarize_with_gemma(all_turns, content[-50_000:])
@@ -538,13 +561,12 @@ def distill_transcript(
             gemma_summary_turn = total_turns
             session_summary_text = _format_session_summary(gemma_summary)
 
-    # Markdown summary file (consumed by the personal source + get_full_document).
-    # Full rewrite on first pass or whenever gemma refreshes the summary; otherwise
-    # append just the new turns to avoid re-emitting the whole file.
-    if turns_processed == 0 or gemma_summary:
-        write_summary_file(summary_path, transcript_id, title, all_turns, gemma_summary)
-    else:
-        write_summary_file(summary_path, transcript_id, title, new_turns, append=True)
+    # Rewrite to replace an unfinished turn rather than duplicating it. The
+    # readable summary remains a retrieval aid; full_content carries raw evidence.
+    markdown_summary = gemma_summary
+    if markdown_summary is None and session_summary_text:
+        markdown_summary = {"summary": session_summary_text}
+    write_summary_file(summary_path, transcript_id, title, all_turns, markdown_summary)
 
     session_chunk = _build_session_chunk(
         title=title,
@@ -556,16 +578,25 @@ def distill_transcript(
         total_turns=total_turns,
     )
 
-    new_byte_offset = byte_offset + len(new_content)
-    db_mod.save_transcript_state(conn, transcript_path, {
+    next_state = {
         "turns_processed": total_turns,
-        "byte_offset": new_byte_offset,
+        "byte_offset": len(raw),
+        "content_hash": content_hash,
         "summary_path": summary_path,
         "gemma_summary_turn": gemma_summary_turn,
         "title": title,
         "transcript_tags": transcript_tags,
         "gemma_summary_text": session_summary_text,
+    }
+    session_chunk.update({
+        "full_content": content,
+        "source_path": str(p.resolve()),
+        "source_hash": content_hash,
+        "transcript_path": transcript_path,
+        "transcript_state": next_state,
     })
+    if save_state:
+        db_mod.save_transcript_state(conn, transcript_path, next_state)
 
     return [session_chunk]
 
@@ -581,7 +612,8 @@ def distill_all_transcripts(
     """Scan all transcript dirs and distill incrementally.
 
     If flush_fn is provided, it is called with each transcript's new chunks
-    immediately after processing (enabling per-file index updates).
+    immediately after processing. It must durably queue the chunks or save their
+    transcript_state with the document; the scanner does not advance that cursor.
     Returns total number of new chunks processed.
     """
     total_new = 0
@@ -601,28 +633,15 @@ def distill_all_transcripts(
         txt_files = list(td_path.glob("*.txt"))
 
         for transcript_file in sorted(jsonl_files + txt_files):
-            state = db_mod.load_transcript_state(conn, str(transcript_file))
-            try:
-                stat = transcript_file.stat()
-                mtime = stat.st_mtime
-                fsize = stat.st_size
-            except OSError:
-                continue
-            if state.get("last_mtime") == mtime and fsize <= state.get("byte_offset", 0):
-                continue
-
             new_chunks = distill_transcript(
                 str(transcript_file), conn, output,
                 gemma_every_n=gemma_every_n, use_gemma=use_gemma,
+                save_state=flush_fn is None,
             )
 
             if new_chunks and flush_fn:
                 flush_fn(new_chunks)
             total_new += len(new_chunks)
-
-            st = db_mod.load_transcript_state(conn, str(transcript_file))
-            st["last_mtime"] = mtime
-            db_mod.save_transcript_state(conn, str(transcript_file), st)
 
     return total_new
 

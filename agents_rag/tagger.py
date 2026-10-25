@@ -72,7 +72,7 @@ def description_from_content(text: str) -> str:
 
 def _tag_cache_path(cache_dir: str, rel_path: str, text: str) -> Path:
     content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
-    key = hashlib.sha256(f"{rel_path}:{content_hash}".encode()).hexdigest()[:16]
+    key = hashlib.sha256(f"{rel_path}:{content_hash}:{producer_fingerprint()}".encode()).hexdigest()[:16]
     return Path(cache_dir) / "tags" / f"{key}.json"
 
 
@@ -163,6 +163,14 @@ def _load_few_shot_examples() -> list[dict]:
     return examples
 
 
+def producer_fingerprint() -> str:
+    """Invalidate derived tags when prompts, examples or configured models change."""
+    payload = {"prompt": _get_system_prompt(), "examples": _load_few_shot_examples(),
+               "profiles": {name: vars(profile) for name, profile in ollama_client._profiles.items()},
+               "endpoint": ollama_client._base_url, "format": "tag-summary-v1"}
+    return hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
 def _build_messages(text: str) -> list[dict]:
     """Build the chat messages array with system prompt, few-shot examples, and the document."""
     messages = [{"role": "system", "content": _get_system_prompt()}]
@@ -247,7 +255,7 @@ def load_overrides(source_root: str) -> dict[str, dict]:
             continue
         meta_dir = meta_path.parent.relative_to(root)
         for filename, entry in data.get("files", {}).items():
-            rel = str(meta_dir / filename) if str(meta_dir) != "." else filename
+            rel = (meta_dir / filename).as_posix() if str(meta_dir) != "." else filename
             overrides[rel] = {
                 "description": str(entry.get("description", "")),
                 "tags": [str(t) for t in entry.get("tags", [])],
