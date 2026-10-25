@@ -258,6 +258,7 @@ def _persist_chunks_to_db(
     use_gemma: bool = True,
     embedding_space: str | None = None,
     expected_hashes: dict | None = None,
+    snapshots: dict[str, str] | None = None,
 ) -> None:
     """Write chunks and their source documents into the DB."""
     root = Path(os.path.expanduser(source_cfg.path))
@@ -272,7 +273,7 @@ def _persist_chunks_to_db(
             full_path = root / rel_path.replace("\\", "/")
         try:
             raw = full_path.read_bytes()
-            content = raw.decode("utf-8")
+            content = snapshots[rel_path] if snapshots is not None else raw.decode("utf-8")
             if expected_hashes and hashlib.sha256(raw).hexdigest() != expected_hashes[rel_path]:
                 raise ValueError(f"Source changed while indexing: {rel_path}")
         except OSError as exc:
@@ -321,6 +322,7 @@ def reindex_source(
     # os.walk with onerror is deliberate: pathlib.rglob can hide permission failures.
     paths = [Path(directory) / name for directory,_,names in os.walk(root,onerror=scan_error,followlinks=False)
              for name in names]
+    observed_paths = {path.relative_to(root).as_posix() for path in paths}
     for path in sorted(paths):
         if not path.is_file() or path.suffix.lower() not in source_cfg.file_types:
             continue
@@ -351,13 +353,18 @@ def reindex_source(
         return meta,vectors,False
     count, limit = embedding_token_budget() if changed else (None,None)
     chunks = []
+    snapshots = {}
     for path in sorted(changed):
-        observed_content = files[path].read_text(encoding="utf-8")
+        raw = files[path].read_bytes()
+        if hashlib.sha256(raw).hexdigest() != hashes[path]:
+            raise ValueError(f"Source changed while indexing: {path}")
+        observed_content = raw.decode("utf-8")
+        snapshots[path] = observed_content
         if source_cfg.min_lines and len(observed_content.splitlines()) < source_cfg.min_lines:
             continue
         pieces = chunk_file(source_cfg.name,root,physical_paths[path],source_cfg.max_chunk_tokens,
                                  max_whole_doc_tokens=source_cfg.max_whole_doc_tokens,
-                                 count_tokens=count,embedding_max_tokens=limit)
+                                 count_tokens=count,embedding_max_tokens=limit,content=observed_content)
         if observed_content.strip() and not pieces:
             raise ValueError(f"Chunking produced no evidence for nonempty source: {path}")
         for piece in pieces:
@@ -367,7 +374,7 @@ def reindex_source(
     tagged = {}
     for chunk in chunks:
         if chunk.path not in tagged:
-            text = files[chunk.path].read_text(encoding="utf-8")
+            text = snapshots[chunk.path]
             tagged[chunk.path] = tag_file(chunk.path,text,source_cfg.path,str(root),overrides,use_gemma=use_gemma)
         chunk.description,chunk.tags = tagged[chunk.path]
     metadata = [_chunk_to_meta(c) for c in chunks]
@@ -375,9 +382,17 @@ def reindex_source(
         vectors = embed_texts([c.embedding_text for c in chunks])
         space = db.register_embedding_space(conn,embedding_profile(),vectors.shape[1])
         _persist_chunks_to_db(conn,source_cfg,chunks,vectors,metadata,use_gemma=use_gemma,
-                              embedding_space=space,expected_hashes=hashes)
+                              embedding_space=space,expected_hashes=hashes,snapshots=snapshots)
     # Empty/deleted documents lose only their live projection; immutable revisions survive.
     with db.transaction(conn):
+        # Empty/filtered files also need a verified snapshot before deletion or checkpointing.
+        for path in changed:
+            if hashlib.sha256(files[path].read_bytes()).hexdigest() != hashes[path]:
+                raise ValueError(f"Source changed while indexing: {path}")
+        for path in removed:
+            relative = path.replace("\\", "/")
+            if relative not in observed_paths and (root / relative).exists():
+                raise ValueError(f"Removed source reappeared while indexing: {path}")
         represented = {c.path for c in chunks}
         for path in removed | (changed - represented):
             conn.execute("DELETE FROM documents WHERE source=? AND path=?", (source_cfg.name,path))

@@ -354,11 +354,47 @@ def test_existing_destination_and_same_source_are_never_overwritten(tmp_path):
     assert _snapshot_files(tmp_path) == original
 
 
-@pytest.mark.parametrize("suffix", [".staging", ".manifest.json", ".migration.lock"])
+@pytest.mark.parametrize("suffix", [
+    ".staging", ".manifest.json", ".migration.lock",
+    ".staging-shm", ".staging-wal", ".staging-journal", "-shm", "-wal", "-journal",
+])
 def test_migration_sidecars_cannot_overwrite_the_original_database(tmp_path, suffix):
     target = tmp_path / "target.db"
     source = Path(str(target) + suffix)
     _seed_sqlite(source)
+    before = _snapshot_files(tmp_path)
+    with pytest.raises(ValueError, match="original input"):
+        migrate(source, target)
+    assert _snapshot_files(tmp_path) == before
+
+
+@pytest.mark.parametrize("suffix", ["-shm", "-wal", "-journal"])
+def test_destination_cannot_replace_a_source_sqlite_sidecar(tmp_path, suffix):
+    source = tmp_path / "source.db"
+    _seed_sqlite(source)
+    target = Path(str(source) + suffix)
+    before = _snapshot_files(tmp_path)
+    with pytest.raises(ValueError, match="original input"):
+        migrate(source, target)
+    assert _snapshot_files(tmp_path) == before
+
+
+@pytest.mark.parametrize("source_kind", ["sqlite", "flat"])
+def test_output_hardlink_to_input_is_rejected_before_writes(tmp_path, source_kind):
+    if source_kind == "sqlite":
+        source = tmp_path / "source.db"
+        _seed_sqlite(source)
+        original_input = source
+    else:
+        source = tmp_path / "flat"
+        _seed_flat(source)
+        original_input = source / "index.npz"
+    target = tmp_path / "target.db"
+    alias = Path(str(target) + ".staging-shm")
+    try:
+        alias.hardlink_to(original_input)
+    except OSError:
+        pytest.skip("Filesystem does not permit hard links")
     before = _snapshot_files(tmp_path)
     with pytest.raises(ValueError, match="original input"):
         migrate(source, target)

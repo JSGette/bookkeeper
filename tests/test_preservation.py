@@ -145,6 +145,145 @@ def test_swallowed_chunk_read_failure_retains_evidence_and_allows_retry(
     assert db.get_document_content(tmp_db, cfg.name, "a.md") == "replacement evidence"
 
 
+@pytest.mark.parametrize("transient", ["", "short temporary write\n"])
+def test_file_changed_between_scan_and_snapshot_never_checkpoints_or_deletes(
+    tmp_path, tmp_db, offline_indexer, monkeypatch, transient,
+):
+    root, cfg = _source(tmp_path)
+    cfg.min_lines = 2
+    path = root / "a.md"
+    original = "Original evidence\nSecond source line\n"
+    path.write_bytes(original.encode("utf-8"))
+    indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    before = inventory(tmp_db)
+    cfg.max_chunk_tokens = 256  # Rebuild while an editor performs an unchanged save.
+
+    def edit_after_scan():
+        path.write_bytes(transient.encode("utf-8"))
+        return len, 2048
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(indexer, "embedding_token_budget", edit_after_scan)
+        with pytest.raises(ValueError, match="Source changed while indexing"):
+            indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert inventory(tmp_db) == before
+    assert not tmp_db.in_transaction
+    path.write_bytes(original.encode("utf-8"))
+    metadata, _, changed = indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert changed is True and metadata
+    assert db.get_document_content(tmp_db, cfg.name, "a.md") == original
+
+
+@pytest.mark.parametrize("transient", ["", "short temporary write\n"])
+def test_empty_or_filtered_snapshot_rechecked_before_deletion(
+    tmp_path, tmp_db, offline_indexer, monkeypatch, transient,
+):
+    root, cfg = _source(tmp_path)
+    cfg.min_lines = 2
+    path = root / "a.md"
+    original = "Original evidence\nSecond source line\n"
+    path.write_bytes(original.encode("utf-8"))
+    indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    before = inventory(tmp_db)
+    path.write_bytes(transient.encode("utf-8"))
+    original_read = Path.read_bytes
+    reads = 0
+
+    def restore_after_snapshot(candidate):
+        nonlocal reads
+        raw = original_read(candidate)
+        if candidate == path:
+            reads += 1
+            if reads == 2:  # Scan and verified snapshot both saw the temporary bytes.
+                path.write_bytes(original.encode("utf-8"))
+        return raw
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "read_bytes", restore_after_snapshot)
+        with pytest.raises(ValueError, match="Source changed while indexing"):
+            indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert inventory(tmp_db) == before
+    assert not tmp_db.in_transaction
+    assert path.read_text(encoding="utf-8") == original
+    metadata, _, changed = indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert changed is False and metadata
+    assert db.get_document_content(tmp_db, cfg.name, "a.md") == original
+
+
+@pytest.mark.parametrize("extension", [".md", ".py", ".txt"])
+def test_chunk_tag_and_document_share_verified_snapshot(
+    tmp_path, tmp_db, offline_indexer, monkeypatch, extension,
+):
+    root, cfg = _source(tmp_path)
+    cfg.file_types = [extension]
+    path = root / ("a" + extension)
+    original = 'def original():\n    return "SNAPSHOT_EVIDENCE"\n'
+    mutable = 'def replacement():\n    return "MUTABLE_DISK_EVIDENCE"\n'
+    path.write_bytes(original.encode("utf-8"))
+    real_chunk_file = indexer.chunk_file
+
+    def change_disk_during_chunking(*args, **kwargs):
+        path.write_bytes(mutable.encode("utf-8"))
+        try:
+            return real_chunk_file(*args, **kwargs)
+        finally:
+            path.write_bytes(original.encode("utf-8"))
+
+    monkeypatch.setattr(indexer, "chunk_file", change_disk_during_chunking)
+    metadata, _, changed = indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert changed is True and metadata
+    assert all("MUTABLE_DISK_EVIDENCE" not in item["text"] for item in metadata)
+    assert any("SNAPSHOT_EVIDENCE" in item["text"] for item in metadata)
+    assert offline_indexer.tag.call_args.args[1] == original
+    assert offline_indexer.summary.call_args.args[0] == original
+    assert db.get_document_content(tmp_db, cfg.name, path.name) == original
+
+
+def test_removed_source_reappearing_during_scan_retains_live_projection(
+    tmp_path, tmp_db, offline_indexer, monkeypatch,
+):
+    root, cfg = _source(tmp_path)
+    path = root / "a.md"
+    original = "Original evidence\n"
+    path.write_bytes(original.encode("utf-8"))
+    indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    before = inventory(tmp_db)
+    path.unlink()
+    real_overrides = indexer.load_overrides
+
+    def restore_after_enumeration(*args, **kwargs):
+        path.write_bytes(original.encode("utf-8"))
+        return real_overrides(*args, **kwargs)
+
+    monkeypatch.setattr(indexer, "load_overrides", restore_after_enumeration)
+    with pytest.raises(ValueError, match="Removed source reappeared"):
+        indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert inventory(tmp_db) == before
+    assert not tmp_db.in_transaction
+
+
+@pytest.mark.parametrize("exclusion", ["skip", "file_types"])
+def test_intentional_config_exclusion_removes_only_live_projection(
+    tmp_path, tmp_db, offline_indexer, exclusion,
+):
+    root, cfg = _source(tmp_path)
+    path = root / "a.md"
+    original = "Original evidence\n"
+    path.write_bytes(original.encode("utf-8"))
+    indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    history = tmp_db.execute("SELECT id,content FROM document_revisions").fetchall()
+    if exclusion == "skip":
+        cfg.skip = ["a.md"]
+    else:
+        cfg.file_types = [".txt"]
+    metadata, _, changed = indexer.reindex_source(cfg, tmp_db, use_gemma=False)
+    assert changed is True and metadata == []
+    assert db.get_document_id(tmp_db, cfg.name, "a.md") is None
+    assert tmp_db.execute("SELECT id,content FROM document_revisions").fetchall() == history
+    assert path.read_text(encoding="utf-8") == original
+    assert db.load_source_state(tmp_db, cfg.name)["content_hashes"] == {}
+
+
 def test_legacy_backslash_identity_survives_reindex_and_source_deletion(
     tmp_path, tmp_db, offline_indexer,
 ):

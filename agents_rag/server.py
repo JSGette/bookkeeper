@@ -274,13 +274,19 @@ def create_app(config_override: dict | None = None) -> FastMCP:
     def _refresh_searcher():
         nonlocal _model_profile_attempted
         profile = embedding_profile()
-        if profile.get("revision") == "unresolved" and not _model_profile_attempted:
+        incomplete_profile = profile.get("tokenizer") is None or profile.get("max_seq_length") is None
+        if incomplete_profile and not _model_profile_attempted:
             with db._write_lock:
                 known = [json.loads(row[0]) for row in conn.execute("SELECT metadata_json FROM embedding_spaces")]
-            if any(item.get("model") == profile.get("model") and item.get("revision") != "unresolved" for item in known):
+            if any(item.get("model") == profile.get("model")
+                   and (profile.get("revision") == "unresolved" or item.get("revision") == profile.get("revision"))
+                   and item.get("tokenizer") is not None and item.get("max_seq_length") is not None
+                   for item in known):
                 _model_profile_attempted = True
                 try:
-                    embedding_token_budget()  # Resolve cached model revision before using any dense vectors.
+                    # A pinned revision still needs its tokenizer and length resolved.
+                    # Dense eligibility continues to require the complete profile match.
+                    embedding_token_budget()
                     profile = embedding_profile()
                 except Exception:
                     log.warning("Embedding model unavailable; retaining lexical retrieval",exc_info=True)

@@ -880,3 +880,78 @@ def test_server_refuses_legacy_database_upgrade_without_mutating_original(tmp_pa
                                     "cache_dir": str(tmp_path / "cache"), "use_gemma": False})
     assert legacy_path.read_bytes() == original
     assert not Path(str(legacy_path) + "-wal").exists()
+
+
+@pytest.mark.parametrize("pinned_revision", ["pinned-commit", None])
+def test_restart_resolves_complete_embedding_profile_before_semantic_query(tmp_path, monkeypatch, pinned_revision):
+    from types import SimpleNamespace
+    from agents_rag import db, indexer, searcher, server
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "fixture-model")
+    if pinned_revision is None:
+        monkeypatch.delenv("EMBEDDING_REVISION", raising=False)
+    else:
+        monkeypatch.setenv("EMBEDDING_REVISION", pinned_revision)
+    model = SimpleNamespace(tokenizer=SimpleNamespace(name_or_path="fixture-tokenizer"), max_seq_length=512)
+    monkeypatch.setattr(indexer, "_model", model)
+    saved_profile = indexer.embedding_profile()
+    path = tmp_path / "bookkeeper.db"
+    conn = db.init_db(str(path))
+    space = db.register_embedding_space(conn, saved_profile, 2)
+    doc = db.upsert_document(conn, "test", "a.md", "", "", "automobile fuel")
+    db.upsert_chunks(conn, doc, [{"text": "automobile fuel"}],
+                     np.array([[1.0, 0.0]], dtype=np.float32), embedding_space=space)
+    conn.close()
+    # Model objects are absent after restart, even when the requested revision is pinned.
+    monkeypatch.setattr(indexer, "_model", None)
+
+    def resolve_model():
+        monkeypatch.setattr(indexer, "_model", model)
+        return len, 512
+
+    config = {"sources": [{"name": "test", "path": str(tmp_path)}], "db_path": str(path),
+              "reranker": {"enabled": False}, "use_gemma": False,
+              "sessions": {"watch_interval_minutes": 0, "output_dir": str(tmp_path / "sessions")}}
+    with patch.object(server, "embedding_token_budget", side_effect=resolve_model) as resolve, \
+         patch.object(searcher, "embed_texts", return_value=np.array([[1.0, 0.0]], dtype=np.float32)) as embed:
+        app = server.create_app(config)
+        result = json.loads(_call(app, "query_knowledge_base", query="vehicle gasoline"))
+        assert [item["path"] for item in result["results"]] == ["a.md"]
+        assert result["results"][0]["cosine_similarity"] == pytest.approx(1.0)
+        assert result["results"][0]["lexical_support"] is False
+        assert resolve.call_count == 1
+        assert embed.call_count == 1
+        _call(app, "query_knowledge_base", query="vehicle gasoline")
+        assert resolve.call_count == 1
+        assert embed.call_count == 1
+
+
+@pytest.mark.parametrize("space_kind", ["legacy", "different_revision", "different_model"])
+def test_restart_keeps_unknown_or_unrelated_embeddings_lexical(tmp_path, monkeypatch, space_kind):
+    from agents_rag import db, indexer, server
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "fixture-model")
+    monkeypatch.setenv("EMBEDDING_REVISION", "pinned-commit")
+    monkeypatch.setattr(indexer, "_model", None)
+    path = tmp_path / "bookkeeper.db"
+    conn = db.init_db(str(path))
+    space = None
+    if space_kind != "legacy":
+        saved_profile = {**indexer.embedding_profile(), "tokenizer": "fixture-tokenizer", "max_seq_length": 512}
+        saved_profile["revision" if space_kind == "different_revision" else "model"] = "different"
+        space = db.register_embedding_space(conn, saved_profile, 2)
+    doc = db.upsert_document(conn, "test", "a.md", "", "", "automobile fuel")
+    db.upsert_chunks(conn, doc, [{"text": "automobile fuel"}],
+                     np.array([[1.0, 0.0]], dtype=np.float32), embedding_space=space)
+    conn.close()
+    config = {"sources": [{"name": "test", "path": str(tmp_path)}], "db_path": str(path),
+              "reranker": {"enabled": False}, "use_gemma": False,
+              "sessions": {"watch_interval_minutes": 0, "output_dir": str(tmp_path / "sessions")}}
+    with patch.object(server, "embedding_token_budget", side_effect=AssertionError("Unrelated vectors must stay lexical")) as resolve:
+        app = server.create_app(config)
+        result = json.loads(_call(app, "query_knowledge_base", query="vehicle gasoline"))
+        assert result["results"] == []
+        resolve.assert_not_called()
+        lexical = json.loads(_call(app, "query_knowledge_base", query="automobile"))
+        assert [item["path"] for item in lexical["results"]] == ["a.md"]
+        assert lexical["results"][0]["cosine_similarity"] is None

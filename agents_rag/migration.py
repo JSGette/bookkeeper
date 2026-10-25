@@ -225,13 +225,20 @@ def _import_flat(conn, source, *, batch_size, interrupt_after=None):
             raise ValueError(f"Flat evidence/vector mismatch at {i}")
 
 
+def _sqlite_paths(path: Path) -> list[Path]:
+    """Reserve paths SQLite can create, replace, or remove when opening a database."""
+    return [path, *(Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal"))]
+
+
 def migrate(source_path, destination, *, dry_run=False, resume=False, batch_size=100, _interrupt_after=None):
     source = select_source(source_path)
     destination = Path(destination).expanduser().resolve()
-    outputs = [destination,Path(str(destination)+".staging"),Path(str(destination)+".manifest.json"),
-               Path(str(destination)+".migration.lock")]
-    inputs = [source] if source.is_file() else _flat_inputs(source)
-    if any(output.resolve() == path.resolve() for output in outputs for path in inputs):
+    outputs = [*_sqlite_paths(destination), *_sqlite_paths(Path(str(destination) + ".staging")),
+               Path(str(destination) + ".manifest.json"), Path(str(destination) + ".migration.lock")]
+    inputs = _sqlite_paths(source) if source.is_file() else _flat_inputs(source)
+    if any(output.resolve() == path.resolve()
+           or (output.exists() and path.exists() and output.samefile(path))
+           for output in outputs for path in inputs):
         raise ValueError("Migration output or sidecar would overwrite an original input")
     manifest = inspect_source(source)
     if destination.exists():

@@ -217,12 +217,14 @@ def chunk_markdown(
     source: str, root: Path, rel_path: str, max_tokens: int,
     max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS,
     *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+    content: str | None = None,
 ) -> list[Chunk]:
     full_path = root / rel_path
-    try:
-        content = full_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+    if content is None:
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
 
     lines = content.splitlines(keepends=True)
     if not content.strip():
@@ -308,13 +310,15 @@ def _try_treesitter_chunk(content: str, source: str, rel_path: str, max_tokens: 
 def chunk_code(
     source: str, root: Path, rel_path: str, max_tokens: int,
     *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+    content: str | None = None,
 ) -> list[Chunk]:
     """Chunk source code files. Uses treesitter if available, else fixed-size."""
     full_path = root / rel_path
-    try:
-        content = full_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+    if content is None:
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
 
     if not content.strip():
         return []
@@ -367,21 +371,23 @@ def chunk_file(
     max_tokens: int = _DEFAULT_MAX_CHUNK_TOKENS,
     max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS,
     *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+    content: str | None = None,
 ) -> list[Chunk]:
     """Chunk a file; optional counter and full-input limit match its embedding model."""
     ext = Path(rel_path).suffix.lower()
     if ext in _MD_EXTENSIONS:
         return chunk_markdown(source, root, rel_path, max_tokens, max_whole_doc_tokens,
-                              count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens)
+                              count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens, content=content)
     elif ext in _CODE_EXTENSIONS:
         return chunk_code(source, root, rel_path, max_tokens,
-                          count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens)
+                          count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens, content=content)
     else:
         full_path = root / rel_path
-        try:
-            content = full_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return []
+        if content is None:
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return []
         if content.strip():
             return _chunk_fixed_size(content, source, rel_path, max_tokens,
                                     count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens)

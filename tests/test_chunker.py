@@ -21,6 +21,37 @@ from agents_rag.chunker import (
 from tests.conftest import make_source_cfg
 
 
+@pytest.mark.parametrize("extension", [".md", ".py", ".txt"])
+def test_supplied_snapshot_never_rereads_mutable_file(tmp_path, monkeypatch, extension):
+    path = tmp_path / ("snapshot" + extension)
+    path.write_text("MUTABLE_DISK_CONTENT", encoding="utf-8")
+    snapshot = 'def source():\n    return "VERIFIED_SNAPSHOT"\n'
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("A supplied snapshot must not reread the filesystem")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+    monkeypatch.setattr(Path, "read_bytes", unexpected_read)
+    chunks = chunk_file("fixture", tmp_path, path.name, max_tokens=512,
+                        max_whole_doc_tokens=0, content=snapshot)
+    assert chunks
+    assert any("VERIFIED_SNAPSHOT" in chunk.text for chunk in chunks)
+    assert all("MUTABLE_DISK_CONTENT" not in chunk.text for chunk in chunks)
+
+
+@pytest.mark.parametrize("extension", [".md", ".py", ".txt"])
+def test_supplied_empty_snapshot_does_not_fall_back_to_disk(tmp_path, monkeypatch, extension):
+    path = tmp_path / ("snapshot" + extension)
+    path.write_text("Content must not be read", encoding="utf-8")
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("An empty snapshot is still an explicit snapshot")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+    monkeypatch.setattr(Path, "read_bytes", unexpected_read)
+    assert chunk_file("fixture", tmp_path, path.name, content="") == []
+
+
 # ---------------------------------------------------------------------------
 # _should_skip
 # ---------------------------------------------------------------------------
