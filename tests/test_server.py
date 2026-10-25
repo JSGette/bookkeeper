@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import textwrap
@@ -87,9 +88,23 @@ def test_load_usage_guide_handles_read_error(monkeypatch):
 def _fake_embed(texts):
     vecs = []
     for t in texts:
-        rng = np.random.RandomState(hash(t) % (2**31))
+        seed = int.from_bytes(hashlib.sha256(t.encode("utf-8")).digest()[:4], "little")
+        rng = np.random.RandomState(seed)
         vecs.append(rng.randn(384).astype(np.float32))
     return np.array(vecs)
+
+
+@pytest.fixture(autouse=True)
+def _offline_models(monkeypatch):
+    """Patch inference before fixtures index data, as well as during test calls."""
+    from agents_rag import indexer, reranker, searcher, server
+
+    monkeypatch.setattr(indexer, "embed_texts", _fake_embed)
+    monkeypatch.setattr(searcher, "embed_texts", _fake_embed)
+    monkeypatch.setattr(server, "embed_texts", _fake_embed)
+    monkeypatch.setattr(server.ollama_client, "status", lambda: {"available": False})
+    monkeypatch.setattr(reranker, "warm", lambda model_name: False)
+    monkeypatch.setattr(reranker, "_get_reranker", lambda model_name: None)
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
@@ -461,22 +476,18 @@ def test_query_knowledge_base_returns_envelope(mock_s, mock_i, tmp_path):
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
-def test_query_knowledge_base_dedupes_near_duplicate(mock_s, mock_i, tmp_path):
-    """The second of two near-identical queries within the dedupe window must
-    be served from cache and carry repeated_query=True in its meta."""
+def test_query_knowledge_base_exact_cache_preserves_scoring(mock_s, mock_i, tmp_path):
+    """Exact cache hits keep the original scoring path and confidence metadata."""
     mcp = _build_app(tmp_path, {
         "search": {"dedupe_similarity_threshold": 0.5, "dedupe_window_seconds": 60},
     })
 
     first = json.loads(_call(mcp, "query_knowledge_base", query="setup guide", max_results=3))
-    assert first["meta"].get("repeated_query") is None or first["meta"]["repeated_query"] is False
+    assert first["meta"].get("cache_hit") in (None, False)
 
     second = json.loads(_call(mcp, "query_knowledge_base", query="setup guide", max_results=3))
-    assert second["meta"]["repeated_query"] is True
-    assert second["meta"]["scoring"] == "cached"
-    assert second["meta"]["previous_query"] == "setup guide"
-    assert isinstance(second["meta"]["hint"], str)
-    assert "rephras" in second["meta"]["hint"].lower()
+    assert second["meta"].pop("cache_hit") is True
+    assert second == first
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
@@ -489,33 +500,22 @@ def test_query_knowledge_base_skips_dedupe_across_source_filters(mock_s, mock_i,
     })
     a = json.loads(_call(mcp, "query_knowledge_base", query="setup guide", max_results=3))
     b = json.loads(_call(mcp, "query_knowledge_base", query="setup guide", max_results=3, source="test"))
-    assert a["meta"].get("repeated_query") in (None, False)
-    assert b["meta"].get("repeated_query") in (None, False)
+    assert a["meta"].get("cache_hit") in (None, False)
+    assert b["meta"].get("cache_hit") in (None, False)
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
-def test_dedupe_lookup_uses_read_only_connection(mock_s, mock_i, tmp_path, monkeypatch):
+def test_exact_cache_hit_avoids_retrieval(mock_s, mock_i, tmp_path, monkeypatch):
     mcp = _build_app(tmp_path, {
         "search": {"dedupe_similarity_threshold": 0.5, "dedupe_window_seconds": 60},
     })
 
-    from agents_rag import db as db_mod
-
-    seen_query_only = []
-    orig = db_mod.get_recent_query_embeddings
-
-    def _wrapped(conn, source_filter, since_seconds=120, limit=5):
-        flag = conn.execute("PRAGMA query_only").fetchone()[0]
-        seen_query_only.append(int(flag))
-        return orig(conn, source_filter, since_seconds=since_seconds, limit=limit)
-
-    monkeypatch.setattr("agents_rag.server.db.get_recent_query_embeddings", _wrapped)
-
+    from agents_rag.searcher import Searcher
     _call(mcp, "query_knowledge_base", query="setup guide", max_results=3)
-    _call(mcp, "query_knowledge_base", query="setup guide", max_results=3)
-    assert seen_query_only
-    assert all(v == 1 for v in seen_query_only)
+    with patch.object(Searcher, "query_with_meta", side_effect=AssertionError("unexpected retrieval")):
+        hit = json.loads(_call(mcp, "query_knowledge_base", query="setup guide", max_results=3))
+    assert hit["meta"]["cache_hit"] is True
 
 
 @patch("agents_rag.indexer.embed_texts", side_effect=_fake_embed)
@@ -622,7 +622,7 @@ def test_prepare_cloud_context_during_reindex_has_no_errors(_mock_d, mock_s, moc
         packets = list(pool.map(_call_prepare, range(6)))
 
     for packet in packets:
-        assert "markdown" in packet
+        assert "markdown" not in packet
         assert "prior_work" in packet
 
     deadline = time.time() + 10
@@ -632,3 +632,326 @@ def test_prepare_cloud_context_during_reindex_has_no_errors(_mock_d, mock_s, moc
             break
         time.sleep(0.1)
     assert json.loads(_call(mcp, "status")).get("reindex_running") is False
+
+
+def test_exact_cache_preserves_low_confidence_and_weak_match(tmp_path):
+    from agents_rag.searcher import Searcher
+
+    mcp = _build_app(tmp_path)
+    weak_results = [{"source": "test", "path": "guide.md", "score": 0.01,
+                     "confidence": "low", "evidence": "Unrelated evidence"}]
+    weak_meta = {"reranker_used": False, "rrf_k": 10, "score_kind": "rrf",
+                 "confidence": "low", "weak_match": True, "confidence_calibrated": False}
+    with patch.object(Searcher, "query_with_meta", return_value=(weak_results, weak_meta)) as retrieve:
+        first = json.loads(_call(mcp, "query_knowledge_base", query="unsupported topic"))
+        second = json.loads(_call(mcp, "query_knowledge_base", query="unsupported topic"))
+    assert retrieve.call_count == 1
+    assert second["meta"].pop("cache_hit") is True
+    assert second == first
+    assert second["meta"]["weak_match"] is True
+    assert second["meta"]["confidence"] == "low"
+    assert second["results"][0]["confidence"] == "low"
+
+
+def test_exact_cache_isolates_query_limit_scope_and_corpus_generation(tmp_path, monkeypatch):
+    from agents_rag import db
+    from agents_rag.searcher import Searcher
+
+    mcp = _build_app(tmp_path)
+    # Even indistinguishable query vectors must not substitute another query's answer.
+    monkeypatch.setattr("agents_rag.searcher.embed_texts",
+                        lambda texts: np.ones((len(texts), 384), dtype=np.float32))
+    original = Searcher.query_with_meta
+    with patch.object(Searcher, "query_with_meta", autospec=True, side_effect=original) as retrieve:
+        base = {"query": "setup v1", "max_results": 1, "source": "test"}
+        _call(mcp, "query_knowledge_base", **base)
+        cached = json.loads(_call(mcp, "query_knowledge_base", **base))
+        assert cached["meta"]["cache_hit"] is True
+        assert retrieve.call_count == 1
+        for changes in ({"query": "setup v2"}, {"query": "not setup v1"},
+                        {"max_results": 2}, {"source": None}):
+            response = json.loads(_call(mcp, "query_knowledge_base", **{**base, **changes}))
+            assert response["meta"].get("cache_hit") in (None, False)
+        assert retrieve.call_count == 5
+        conn = db.init_db(str(tmp_path / "cache" / "bookkeeper.db"))
+        try:
+            db.upsert_document(conn, "test", "guide.md", "Changed guide", "", "Changed source evidence")
+        finally:
+            conn.close()
+        changed = json.loads(_call(mcp, "query_knowledge_base", **base))
+        assert changed["meta"].get("cache_hit") in (None, False)
+        assert changed["meta"]["generation"] > cached["meta"]["generation"]
+        assert retrieve.call_count == 6
+
+
+def test_deprecation_invalidates_exact_cached_response(tmp_path):
+    mcp = _build_app(tmp_path)
+    first = json.loads(_call(mcp, "query_knowledge_base", query="setup"))
+    assert first["results"]
+    assert not first["results"][0].get("deprecated")
+    hit = json.loads(_call(mcp, "query_knowledge_base", query="setup"))
+    assert hit["meta"]["cache_hit"] is True
+
+    assert json.loads(_call(mcp, "deprecate_doc", path="guide.md", reason="Use guide v2"))["status"] == "deprecated"
+    deprecated = json.loads(_call(mcp, "query_knowledge_base", query="setup"))
+    assert deprecated["meta"].get("cache_hit") in (None, False)
+    assert all(result["deprecated"] for result in deprecated["results"])
+    assert "guide v2" in deprecated["results"][0]["deprecation_notice"]
+    _call(mcp, "deprecate_doc", path="guide.md", undeprecate=True)
+    restored = json.loads(_call(mcp, "query_knowledge_base", query="setup"))
+    assert restored["meta"].get("cache_hit") in (None, False)
+    assert not restored["results"][0].get("deprecated")
+
+
+@pytest.mark.parametrize("path_kind", ["absolute", "traversal", "symlink"])
+def test_full_document_rejects_files_outside_source_roots(tmp_path, path_kind):
+    mcp = _build_app(tmp_path)
+    outside = tmp_path / "private.txt"
+    outside.write_text("OUTSIDE_PRIVATE_MARKER", encoding="utf-8")
+    if path_kind == "absolute":
+        requested = str(outside)
+    elif path_kind == "traversal":
+        requested = "../private.txt"
+    else:
+        link = tmp_path / "docs" / "escape.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"Filesystem symlinks unavailable: {exc}")
+        requested = "escape.txt"
+    response = _call(mcp, "get_full_document", path=requested, source="test")
+    assert "OUTSIDE_PRIVATE_MARKER" not in response
+    assert "error" in json.loads(response)
+    allowed = tmp_path / "docs" / "local.txt"
+    allowed.write_text("ALLOWED_LOCAL_MARKER", encoding="utf-8")
+    assert _call(mcp, "get_full_document", path="local.txt", source="test") == "ALLOWED_LOCAL_MARKER"
+
+
+def test_full_document_requires_scope_for_ambiguous_paths(tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "guide.md").write_text("# Other\n\nOTHER_SOURCE_MARKER", encoding="utf-8")
+    mcp = _build_app(tmp_path, {"sources": [
+        {"name": "test", "path": str(tmp_path / "docs"), "file_types": [".md"]},
+        {"name": "other", "path": str(other), "file_types": [".md"]},
+    ]})
+    ambiguous = json.loads(_call(mcp, "get_full_document", path="guide.md"))
+    assert "ambiguous" in ambiguous["error"].lower()
+    assert "Run pip install" in _call(mcp, "get_full_document", path="guide.md", source="test")
+    assert "OTHER_SOURCE_MARKER" in _call(mcp, "get_full_document", path="guide.md", source="other")
+    wrong_scope = json.loads(_call(mcp, "get_full_document", path="guide.md", source="unknown"))
+    assert "error" in wrong_scope
+
+
+@pytest.mark.parametrize("include_markdown", [False, True])
+def test_prepare_cloud_context_caps_serialized_tokens_and_preserves_short_task(tmp_path, include_markdown):
+    import tiktoken
+
+    mcp = _build_app(tmp_path)
+    user_prompt = "Keep café IDs unchanged; never delete data."
+    tool_outputs = [{"name": f"tool-{i}", "stdout": ("变量 🚀 café {version: 'v2'}\n" * 200)}
+                    for i in range(5)]
+    payload = _call(mcp, "prepare_cloud_context", query="setup", user_prompt=user_prompt,
+                    max_context_tokens=600, include_markdown=include_markdown,
+                    tool_outputs_json=json.dumps(tool_outputs, ensure_ascii=False))
+    packet = json.loads(payload)
+    actual_tokens = len(tiktoken.get_encoding("cl100k_base").encode(payload, disallowed_special=()))
+    assert actual_tokens <= 600
+    assert packet["meta"]["token_count"] == actual_tokens
+    assert packet["user_prompt"] == user_prompt
+    assert packet["meta"]["omitted_count"] > 0
+    assert ("markdown" in packet) is include_markdown
+    if include_markdown:
+        assert user_prompt in packet["markdown"]
+
+
+def test_prepare_cloud_context_uses_exact_immutable_evidence(tmp_path):
+    mcp = _build_app(tmp_path)
+    results = json.loads(_call(mcp, "query_knowledge_base", query="setup"))["results"]
+    assert results
+    spans = {span["evidence_id"]: span for hit in results for span in hit["evidence_spans"]}
+    packet = json.loads(_call(mcp, "prepare_cloud_context", query="setup", max_context_tokens=4000))
+    assert packet["prior_work"]
+    for entry in packet["prior_work"]:
+        expected = spans[entry["evidence_id"]]
+        assert entry["text"] == expected["text"]
+        assert entry["revision_id"] == expected["revision_id"]
+        assert entry["completeness"] == expected["completeness"]
+
+
+def _wait_until(predicate, *, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = predicate()
+        if result:
+            return result
+        time.sleep(0.02)
+    raise AssertionError("Timed out waiting for background work")
+
+
+def test_failed_transcript_embedding_retains_job_and_defers_checkpoint_until_retry(tmp_path, sample_transcript, monkeypatch):
+    from agents_rag import db, server
+
+    mcp = _build_app(tmp_path, {"sessions": {
+        "transcript_dirs": [str(sample_transcript)], "output_dir": str(tmp_path / "sessions"),
+        "watch_interval_minutes": 0,
+    }})
+    transcript = next(sample_transcript.glob("*.txt"))
+    raw_content = transcript.read_bytes().decode("utf-8")
+    conn = db.init_db(str(tmp_path / "cache" / "bookkeeper.db"))
+
+    def fail_embedding(_texts):
+        raise RuntimeError("synthetic embedding failure")
+
+    monkeypatch.setattr(server, "embed_texts", fail_embedding)
+    try:
+        scan = json.loads(_call(mcp, "distill_transcripts"))
+        assert scan["new_turns_indexed"] == 1
+        _wait_until(lambda: conn.execute("SELECT 1 FROM ingestion_jobs WHERE status='failed'").fetchone())
+        assert db.load_transcript_state(conn, str(transcript)) == {}
+        assert conn.execute("SELECT COUNT(*) FROM documents WHERE source='sessions'").fetchone()[0] == 0
+        assert json.loads(_call(mcp, "status"))["pending_ingestion_jobs"] == 1
+
+        monkeypatch.setattr(server, "embed_texts", _fake_embed)
+        assert json.loads(_call(mcp, "retry_ingestion"))["queued"] == 1
+        _wait_until(lambda: json.loads(_call(mcp, "status"))["pending_ingestion_jobs"] == 0)
+        state = db.load_transcript_state(conn, str(transcript))
+        assert state["byte_offset"] == len(transcript.read_bytes())
+        assert state["content_hash"] == hashlib.sha256(transcript.read_bytes()).hexdigest()
+        path, content, completeness = conn.execute(
+            "SELECT path,content,completeness FROM documents WHERE source='sessions'",
+        ).fetchone()
+        assert content == raw_content
+        assert completeness == "transcript"
+        assert _call(mcp, "get_full_document", path=path, source="sessions") == raw_content
+        job = conn.execute("SELECT status,attempts,error FROM ingestion_jobs").fetchone()
+        assert job == ("done", 2, None)
+        assert json.loads(_call(mcp, "retry_ingestion"))["queued"] == 0
+    finally:
+        conn.close()
+
+
+def test_retry_older_failed_snapshot_cannot_overwrite_newer_accepted_transcript(tmp_path, sample_transcript, monkeypatch):
+    from agents_rag import db, server
+
+    mcp = _build_app(tmp_path, {"sessions": {
+        "transcript_dirs": [str(sample_transcript)], "output_dir": str(tmp_path / "sessions"),
+        "watch_interval_minutes": 0,
+    }})
+    transcript = next(sample_transcript.glob("*.txt"))
+    conn = db.init_db(str(tmp_path / "cache" / "bookkeeper.db"))
+    try:
+        with patch("agents_rag.server.embed_texts", side_effect=RuntimeError("first snapshot failed")):
+            _call(mcp, "distill_transcripts")
+            _wait_until(lambda: conn.execute("SELECT 1 FROM ingestion_jobs WHERE status='failed'").fetchone())
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write("\nLATEST_ACCEPTED_EVIDENCE_MARKER\n")
+        latest_content = transcript.read_bytes().decode("utf-8")
+        _call(mcp, "distill_transcripts")
+        _wait_until(lambda: conn.execute("SELECT COUNT(*) FROM ingestion_jobs WHERE status='done'").fetchone()[0] >= 1)
+        expected_state = db.load_transcript_state(conn, str(transcript))
+        assert expected_state["byte_offset"] == len(transcript.read_bytes())
+        before = conn.execute("SELECT path,content,revision_id FROM documents WHERE source='sessions'").fetchone()
+        assert before[1] == latest_content
+
+        _call(mcp, "retry_ingestion")
+        _wait_until(lambda: not db.pending_ingestion(conn))
+        after = conn.execute("SELECT path,content,revision_id FROM documents WHERE source='sessions'").fetchone()
+        assert after == before
+        assert db.load_transcript_state(conn, str(transcript)) == expected_state
+        assert _call(mcp, "get_full_document", path=after[0], source="sessions") == latest_content
+    finally:
+        conn.close()
+
+
+def test_server_refuses_legacy_database_upgrade_without_mutating_original(tmp_path):
+    import sqlite3
+    from agents_rag.server import create_app
+
+    legacy_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy_path)
+    conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, content TEXT)")
+    conn.execute("INSERT INTO documents(content) VALUES ('preserve original evidence')")
+    conn.commit()
+    conn.close()
+    original = legacy_path.read_bytes()
+    with pytest.raises(ValueError, match="Legacy database requires"):
+        create_app(config_override={"sources": [], "db_path": str(legacy_path),
+                                    "cache_dir": str(tmp_path / "cache"), "use_gemma": False})
+    assert legacy_path.read_bytes() == original
+    assert not Path(str(legacy_path) + "-wal").exists()
+
+
+@pytest.mark.parametrize("pinned_revision", ["pinned-commit", None])
+def test_restart_resolves_complete_embedding_profile_before_semantic_query(tmp_path, monkeypatch, pinned_revision):
+    from types import SimpleNamespace
+    from agents_rag import db, indexer, searcher, server
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "fixture-model")
+    if pinned_revision is None:
+        monkeypatch.delenv("EMBEDDING_REVISION", raising=False)
+    else:
+        monkeypatch.setenv("EMBEDDING_REVISION", pinned_revision)
+    model = SimpleNamespace(tokenizer=SimpleNamespace(name_or_path="fixture-tokenizer"), max_seq_length=512)
+    monkeypatch.setattr(indexer, "_model", model)
+    saved_profile = indexer.embedding_profile()
+    path = tmp_path / "bookkeeper.db"
+    conn = db.init_db(str(path))
+    space = db.register_embedding_space(conn, saved_profile, 2)
+    doc = db.upsert_document(conn, "test", "a.md", "", "", "automobile fuel")
+    db.upsert_chunks(conn, doc, [{"text": "automobile fuel"}],
+                     np.array([[1.0, 0.0]], dtype=np.float32), embedding_space=space)
+    conn.close()
+    # Model objects are absent after restart, even when the requested revision is pinned.
+    monkeypatch.setattr(indexer, "_model", None)
+
+    def resolve_model():
+        monkeypatch.setattr(indexer, "_model", model)
+        return len, 512
+
+    config = {"sources": [{"name": "test", "path": str(tmp_path)}], "db_path": str(path),
+              "reranker": {"enabled": False}, "use_gemma": False,
+              "sessions": {"watch_interval_minutes": 0, "output_dir": str(tmp_path / "sessions")}}
+    with patch.object(server, "embedding_token_budget", side_effect=resolve_model) as resolve, \
+         patch.object(searcher, "embed_texts", return_value=np.array([[1.0, 0.0]], dtype=np.float32)) as embed:
+        app = server.create_app(config)
+        result = json.loads(_call(app, "query_knowledge_base", query="vehicle gasoline"))
+        assert [item["path"] for item in result["results"]] == ["a.md"]
+        assert result["results"][0]["cosine_similarity"] == pytest.approx(1.0)
+        assert result["results"][0]["lexical_support"] is False
+        assert resolve.call_count == 1
+        assert embed.call_count == 1
+        _call(app, "query_knowledge_base", query="vehicle gasoline")
+        assert resolve.call_count == 1
+        assert embed.call_count == 1
+
+
+@pytest.mark.parametrize("space_kind", ["legacy", "different_revision", "different_model"])
+def test_restart_keeps_unknown_or_unrelated_embeddings_lexical(tmp_path, monkeypatch, space_kind):
+    from agents_rag import db, indexer, server
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "fixture-model")
+    monkeypatch.setenv("EMBEDDING_REVISION", "pinned-commit")
+    monkeypatch.setattr(indexer, "_model", None)
+    path = tmp_path / "bookkeeper.db"
+    conn = db.init_db(str(path))
+    space = None
+    if space_kind != "legacy":
+        saved_profile = {**indexer.embedding_profile(), "tokenizer": "fixture-tokenizer", "max_seq_length": 512}
+        saved_profile["revision" if space_kind == "different_revision" else "model"] = "different"
+        space = db.register_embedding_space(conn, saved_profile, 2)
+    doc = db.upsert_document(conn, "test", "a.md", "", "", "automobile fuel")
+    db.upsert_chunks(conn, doc, [{"text": "automobile fuel"}],
+                     np.array([[1.0, 0.0]], dtype=np.float32), embedding_space=space)
+    conn.close()
+    config = {"sources": [{"name": "test", "path": str(tmp_path)}], "db_path": str(path),
+              "reranker": {"enabled": False}, "use_gemma": False,
+              "sessions": {"watch_interval_minutes": 0, "output_dir": str(tmp_path / "sessions")}}
+    with patch.object(server, "embedding_token_budget", side_effect=AssertionError("Unrelated vectors must stay lexical")) as resolve:
+        app = server.create_app(config)
+        result = json.loads(_call(app, "query_knowledge_base", query="vehicle gasoline"))
+        assert result["results"] == []
+        resolve.assert_not_called()
+        lexical = json.loads(_call(app, "query_knowledge_base", query="automobile"))
+        assert [item["path"] for item in lexical["results"]] == ["a.md"]
+        assert lexical["results"][0]["cosine_similarity"] is None

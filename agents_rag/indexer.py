@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -14,7 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .chunker import Chunk, SourceConfig, chunk_source
+from .chunker import Chunk, SourceConfig, chunk_source, chunk_file, _should_skip
+from . import db
 from .db import (
     get_document_id,
     load_all_chunks,
@@ -23,7 +25,7 @@ from .db import (
     upsert_chunks,
     upsert_document,
 )
-from .tagger import load_overrides, tag_file, description_from_content
+from .tagger import load_overrides, tag_file, description_from_content, producer_fingerprint
 
 log = logging.getLogger(__name__)
 
@@ -49,12 +51,39 @@ def _get_model():
             if _model is None:
                 from sentence_transformers import SentenceTransformer
                 model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-                _model = SentenceTransformer(model_name)
+                _model = SentenceTransformer(model_name, revision=os.environ.get("EMBEDDING_REVISION"))
     return _model
+
+
+def embedding_profile() -> dict:
+    revision = os.environ.get("EMBEDDING_REVISION")
+    if _model is not None and revision is None:
+        try:
+            revision = _model[0].auto_model.config._commit_hash
+        except (AttributeError, TypeError, IndexError):
+            pass
+    return {"model": os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+            "revision": revision or "unresolved", "input_format": "bounded-evidence-v1",
+            "tokenizer": getattr(getattr(_model, "tokenizer", None), "name_or_path", None),
+            "max_seq_length": getattr(_model, "max_seq_length", None), "normalized": False}
+
+
+def embedding_config() -> dict:
+    """Stable requested identity, separate from lazy resolution of a model commit."""
+    return {"model":os.environ.get("EMBEDDING_MODEL","BAAI/bge-small-en-v1.5"),
+            "revision":os.environ.get("EMBEDDING_REVISION"),"input_format":"bounded-evidence-v1"}
+
+
+def embedding_token_budget():
+    model = _get_model()
+    return (lambda text: len(model.tokenizer.encode(text, add_special_tokens=True))), int(model.max_seq_length)
 
 
 def embed_texts(texts: list[str]) -> np.ndarray:
     model = _get_model()
+    count, limit = embedding_token_budget()
+    if any(count(text) > limit for text in texts):
+        raise ValueError("Embedding input exceeds model token budget; split evidence before embedding")
     with _encode_lock:
         return model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
 
@@ -227,6 +256,9 @@ def _persist_chunks_to_db(
     vectors: np.ndarray,
     metadata: list[dict],
     use_gemma: bool = True,
+    embedding_space: str | None = None,
+    expected_hashes: dict | None = None,
+    snapshots: dict[str, str] | None = None,
 ) -> None:
     """Write chunks and their source documents into the DB."""
     root = Path(os.path.expanduser(source_cfg.path))
@@ -237,23 +269,27 @@ def _persist_chunks_to_db(
 
     for rel_path, items in docs_by_path.items():
         full_path = root / rel_path
+        if not full_path.exists() and "\\" in rel_path:
+            full_path = root / rel_path.replace("\\", "/")
         try:
-            content = full_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            content = ""
+            raw = full_path.read_bytes()
+            content = snapshots[rel_path] if snapshots is not None else raw.decode("utf-8")
+            if expected_hashes and hashlib.sha256(raw).hexdigest() != expected_hashes[rel_path]:
+                raise ValueError(f"Source changed while indexing: {rel_path}")
+        except OSError as exc:
+            raise ValueError(f"Cannot read source: {full_path}") from exc
         title = items[0][0].get("doc_title", "")
         preamble = items[0][0].get("doc_preamble", "")
         summary = summarize_document(
             content, title=title, use_gemma=use_gemma, path=rel_path,
         )
-        doc_id = upsert_document(
-            conn, source_cfg.name, rel_path, title, preamble, content, summary=summary,
-        )
-
         chunk_metas = [m for m, _ in items]
-        chunk_vecs_idx = [idx for _, idx in items]
-        chunk_vecs = vectors[chunk_vecs_idx]
-        upsert_chunks(conn, doc_id, chunk_metas, chunk_vecs)
+        chunk_vecs = vectors[[idx for _, idx in items]]
+        with db.transaction(conn):
+            doc_id = upsert_document(conn, source_cfg.name, rel_path, title, preamble, content,
+                                     summary=summary, completeness="source")
+            upsert_chunks(conn, doc_id, chunk_metas, chunk_vecs, embedding_space=embedding_space)
+
 
 
 # ---------------------------------------------------------------------------
@@ -267,120 +303,107 @@ def reindex_source(
 ) -> tuple[list[dict], np.ndarray, bool]:
     """Reindex a single source. Returns (metadata, vectors, index_changed).
 
-    Uses git delta for git-tracked sources, mtime for others.
+    Hashes source content and producer settings; processes only changed documents.
     """
-    t0 = time.monotonic()
-    root = Path(os.path.expanduser(source_cfg.path))
-    source_state = load_source_state(conn, source_cfg.name)
-
-    all_chunks = chunk_source(source_cfg)
-    log.info("Chunked %s: %d chunks from %d files",
-             source_cfg.name, len(all_chunks), len({c.path for c in all_chunks}))
-
-    changed_files: set[str] | None = None
-    is_git = (root / ".git").exists()
-
-    if is_git:
-        old_hash = source_state.get("commit_hash")
-        new_hash = _git_head(str(root))
-        if old_hash and new_hash and old_hash != new_hash:
-            delta = _git_changed_files(str(root), old_hash, new_hash, source_cfg.file_types)
-            if delta is not None:
-                changed_files = set(delta)
-                log.info("Git delta: %d changed files since %s", len(changed_files), old_hash[:8])
-        elif old_hash == new_hash:
-            old_mtimes = source_state.get("mtimes", {})
-            new_mtimes = _collect_mtimes(root, all_chunks)
-            changed_files = _mtime_changed_files(old_mtimes, new_mtimes)
-            if not changed_files:
-                log.info("No changes detected for %s, skipping reindex", source_cfg.name)
-                existing_meta, existing_vecs = load_all_chunks(conn, source=source_cfg.name)
-                if existing_meta:
-                    return existing_meta, existing_vecs, False
-    else:
-        old_mtimes = source_state.get("mtimes", {})
-        new_mtimes = _collect_mtimes(root, all_chunks)
-        changed_files = _mtime_changed_files(old_mtimes, new_mtimes)
-        if not changed_files:
-            log.info("No mtime changes for %s", source_cfg.name)
-            existing_meta, existing_vecs = load_all_chunks(conn, source=source_cfg.name)
-            if existing_meta:
-                return existing_meta, existing_vecs, False
-
-    # Apply tagging
+    root = Path(os.path.expanduser(source_cfg.path)).resolve()
+    if not root.is_dir():
+        raise ValueError(f"Source unavailable; retaining existing evidence: {root}")
+    state = load_source_state(conn, source_cfg.name)
+    with db._write_lock:
+        existing_paths = {row[0] for row in conn.execute("SELECT path FROM documents WHERE source=?", (source_cfg.name,))}
+    # Retain old path identities, including paths serialized by Windows versions.
+    legacy_aliases = {path.replace("\\", "/"): path for path in sorted(existing_paths)}
+    files = {}
+    physical_paths = {}
+    hashes = {}
+    mtimes = {}
+    def scan_error(error):
+        raise error
+    # os.walk with onerror is deliberate: pathlib.rglob can hide permission failures.
+    paths = [Path(directory) / name for directory,_,names in os.walk(root,onerror=scan_error,followlinks=False)
+             for name in names]
+    observed_paths = {path.relative_to(root).as_posix() for path in paths}
+    for path in sorted(paths):
+        if not path.is_file() or path.suffix.lower() not in source_cfg.file_types:
+            continue
+        if not path.resolve().is_relative_to(root):
+            continue
+        relative = path.relative_to(root).as_posix()
+        if _should_skip(relative, source_cfg.skip):
+            continue
+        stable_path = relative if relative in existing_paths else legacy_aliases.get(relative,relative)
+        files[stable_path] = path
+        physical_paths[stable_path] = relative
+        hashes[stable_path] = hashlib.sha256(path.read_bytes()).hexdigest()
+        mtimes[stable_path] = path.stat().st_mtime
+    # Fingerprint configuration and producers, not timestamps alone. No tokenization/tagging on clean scans.
     overrides = load_overrides(source_cfg.path)
-
-    def _tag_one(chunk: Chunk) -> tuple[str, list[str]]:
-        return tag_file(chunk.path, chunk.text, source_cfg.path, str(root), overrides, use_gemma=use_gemma)
-
-    if use_gemma and len(all_chunks) > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(_tag_one, all_chunks))
-        for chunk, (desc, tags) in zip(all_chunks, results):
-            chunk.description = desc
-            chunk.tags = tags
-    else:
-        for chunk in all_chunks:
-            chunk.description, chunk.tags = _tag_one(chunk)
-
-    # Delta reindex: reuse existing embeddings for unchanged files
-    if changed_files is not None and changed_files:
-        existing_meta, existing_vecs = load_all_chunks(conn, source=source_cfg.name)
-        if existing_meta:
-            existing_by_key: dict[tuple, int] = {}
-            for i, m in enumerate(existing_meta):
-                key = (m["source"], m["path"], m.get("section_heading", ""))
-                existing_by_key[key] = i
-
-            new_chunks_to_embed = []
-            reuse_indices = []
-            for chunk in all_chunks:
-                key = (chunk.source, chunk.path, chunk.section_heading)
-                if chunk.path not in changed_files and key in existing_by_key:
-                    reuse_indices.append(existing_by_key[key])
-                else:
-                    new_chunks_to_embed.append(chunk)
-
-            if new_chunks_to_embed:
-                log.info("Embedding %d new/changed chunks (reusing %d)",
-                         len(new_chunks_to_embed), len(reuse_indices))
-                new_vecs = embed_texts([c.embedding_text for c in new_chunks_to_embed])
-            else:
-                new_vecs = np.empty((0, existing_vecs.shape[1] if len(existing_vecs) > 0 else 384))
-
-            parts = []
-            if reuse_indices:
-                parts.append(existing_vecs[reuse_indices])
-            if len(new_vecs) > 0:
-                parts.append(new_vecs)
-
-            reused_chunks = [c for c in all_chunks if c.path not in changed_files
-                            and (c.source, c.path, c.section_heading) in existing_by_key]
-            ordered_chunks = reused_chunks + new_chunks_to_embed
-            vectors = np.vstack(parts) if parts else np.empty((0, 384))
-            metadata = [_chunk_to_meta(c) for c in ordered_chunks]
-
-            _persist_chunks_to_db(conn, source_cfg, ordered_chunks, vectors, metadata, use_gemma=use_gemma)
-            _update_state(conn, source_cfg, root, all_chunks, is_git)
-            elapsed = time.monotonic() - t0
-            log.info("Delta reindex %s: %d chunks in %.1fs", source_cfg.name, len(metadata), elapsed)
-            return metadata, vectors, True
-
-    # Full reindex
-    if not all_chunks:
-        _update_state(conn, source_cfg, root, all_chunks, is_git)
-        return [], np.empty((0, 384)), True
-
-    log.info("Full embedding of %d chunks for %s", len(all_chunks), source_cfg.name)
-    vectors = embed_texts([c.embedding_text for c in all_chunks])
-    metadata = [_chunk_to_meta(c) for c in all_chunks]
-
-    _persist_chunks_to_db(conn, source_cfg, all_chunks, vectors, metadata, use_gemma=use_gemma)
-    _update_state(conn, source_cfg, root, all_chunks, is_git)
-    elapsed = time.monotonic() - t0
-    log.info("Full reindex %s: %d chunks in %.1fs", source_cfg.name, len(metadata), elapsed)
-    return metadata, vectors, True
+    pipeline = db._digest([vars(source_cfg), embedding_config(), use_gemma, overrides,
+                           producer_fingerprint() if use_gemma else None, "index-v2"])
+    old_hashes = state.get("content_hashes", {})
+    changed = {p for p,h in hashes.items() if old_hashes.get(p) != h}
+    removed = existing_paths - set(hashes)
+    if state.get("pipeline") != pipeline:
+        changed = set(files)
+    profile = embedding_profile()
+    if profile.get("revision") != "unresolved" and state.get("embedding_profile") != profile:
+        changed = set(files)
+    if not changed and not removed and state.get("content_hashes") is not None:
+        meta, vectors = load_all_chunks(conn, source=source_cfg.name)
+        return meta,vectors,False
+    count, limit = embedding_token_budget() if changed else (None,None)
+    chunks = []
+    snapshots = {}
+    for path in sorted(changed):
+        raw = files[path].read_bytes()
+        if hashlib.sha256(raw).hexdigest() != hashes[path]:
+            raise ValueError(f"Source changed while indexing: {path}")
+        observed_content = raw.decode("utf-8")
+        snapshots[path] = observed_content
+        if source_cfg.min_lines and len(observed_content.splitlines()) < source_cfg.min_lines:
+            continue
+        pieces = chunk_file(source_cfg.name,root,physical_paths[path],source_cfg.max_chunk_tokens,
+                                 max_whole_doc_tokens=source_cfg.max_whole_doc_tokens,
+                                 count_tokens=count,embedding_max_tokens=limit,content=observed_content)
+        if observed_content.strip() and not pieces:
+            raise ValueError(f"Chunking produced no evidence for nonempty source: {path}")
+        for piece in pieces:
+            piece.path = path
+        chunks.extend(pieces)
+    # Tag once per changed document and reuse the result for its segments.
+    tagged = {}
+    for chunk in chunks:
+        if chunk.path not in tagged:
+            text = snapshots[chunk.path]
+            tagged[chunk.path] = tag_file(chunk.path,text,source_cfg.path,str(root),overrides,use_gemma=use_gemma)
+        chunk.description,chunk.tags = tagged[chunk.path]
+    metadata = [_chunk_to_meta(c) for c in chunks]
+    if chunks:
+        vectors = embed_texts([c.embedding_text for c in chunks])
+        space = db.register_embedding_space(conn,embedding_profile(),vectors.shape[1])
+        _persist_chunks_to_db(conn,source_cfg,chunks,vectors,metadata,use_gemma=use_gemma,
+                              embedding_space=space,expected_hashes=hashes,snapshots=snapshots)
+    # Empty/deleted documents lose only their live projection; immutable revisions survive.
+    with db.transaction(conn):
+        # Empty/filtered files also need a verified snapshot before deletion or checkpointing.
+        for path in changed:
+            if hashlib.sha256(files[path].read_bytes()).hexdigest() != hashes[path]:
+                raise ValueError(f"Source changed while indexing: {path}")
+        for path in removed:
+            relative = path.replace("\\", "/")
+            if relative not in observed_paths and (root / relative).exists():
+                raise ValueError(f"Removed source reappeared while indexing: {path}")
+        represented = {c.path for c in chunks}
+        for path in removed | (changed - represented):
+            conn.execute("DELETE FROM documents WHERE source=? AND path=?", (source_cfg.name,path))
+        save_source_state(conn,source_cfg.name,{
+            "content_hashes": hashes, "mtimes": mtimes,
+            "pipeline": pipeline, "embedding_profile": embedding_profile(),
+            "commit_hash": _git_head(str(root)) if (root / ".git").exists() else None,
+            "indexed_at": db._now(),
+        })
+    meta,vectors = load_all_chunks(conn,source=source_cfg.name)
+    return meta,vectors,True
 
 
 def _update_state(

@@ -30,7 +30,7 @@ include = ["agents_rag*"]
 exclude = ["eval*", "tests*", "docs*"]
 
 [tool.setuptools.package-data]
-agents_rag = ["static/*.html"]
+agents_rag = ["static/*.html", "knowledge-base-protocol.md", "examples.jsonl"]
 
 [build-system]
 requires = ["setuptools>=68"]

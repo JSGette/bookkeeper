@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import pytest
+
+from agents_rag import tagger
 
 from agents_rag.tagger import (
     _clean_description,
@@ -226,3 +231,44 @@ def test_tag_file_gemma_override_priority(mock_gemma):
     )
     assert desc == "Manual"
     assert tags[0] == "manual"  # override tags come first
+
+
+@pytest.mark.parametrize("setting", ["prompt", "examples", "model", "profile_limits"])
+def test_generated_tag_cache_misses_when_producer_configuration_changes(tmp_path, monkeypatch, setting):
+    examples = tmp_path / "examples.jsonl"
+    example = {"excerpt": "Example source", "description": "Original example description", "tags": ["original-example"]}
+    examples.write_text(json.dumps(example) + "\n", encoding="utf-8")
+    monkeypatch.setattr(tagger, "_tagger_prompt", "Original tagger instructions")
+    monkeypatch.setattr(tagger, "_tagger_examples_path", str(examples))
+    original_profile = replace(tagger.ollama_client.get_profile("fast"), name="offline-model-v1")
+    profiles = {**tagger.ollama_client._profiles, "fast": original_profile}
+    monkeypatch.setattr(tagger.ollama_client, "_profiles", profiles)
+    generated = Mock(side_effect=[
+        {"description": "Original generated description for this source.", "tags": ["old-semantic-tag"]},
+        {"description": "Updated generated description for this source.", "tags": ["new-semantic-tag"]},
+    ])
+    monkeypatch.setattr(tagger.ollama_client, "chat_json", generated)
+    source = "The source text remains exactly the same."
+    cache = str(tmp_path / "cache")
+
+    first = tagger.generate_tags_gemma(source, "guide.md", cache)
+    assert tagger.generate_tags_gemma(source, "guide.md", cache) == first
+    assert generated.call_count == 1
+
+    if setting == "prompt":
+        monkeypatch.setattr(tagger, "_tagger_prompt", "Changed tagger instructions")
+    elif setting == "examples":
+        # Editing the existing examples file must invalidate cached generations.
+        example["description"] = "Changed example description"
+        examples.write_text(json.dumps(example) + "\n", encoding="utf-8")
+    elif setting == "model":
+        monkeypatch.setattr(tagger.ollama_client, "_profiles", {**profiles, "fast": replace(original_profile, name="offline-model-v2")})
+    else:
+        monkeypatch.setattr(tagger.ollama_client, "_profiles", {**profiles, "fast": replace(original_profile, max_input_chars=1234)})
+
+    changed = tagger.generate_tags_gemma(source, "guide.md", cache)
+    assert generated.call_count == 2
+    assert changed != first
+    assert changed["tags"] == ["new-semantic-tag"]
+    assert tagger.generate_tags_gemma(source, "guide.md", cache) == changed
+    assert generated.call_count == 2

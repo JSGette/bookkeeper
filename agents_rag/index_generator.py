@@ -56,7 +56,7 @@ def _section_for_path(rel_path: str) -> str:
     if len(parts) == 1:
         return "Root"
     # Use directory path as section name (e.g. "conduit/", "plans/", "datadog-agent/plans/")
-    dir_path = str(Path(*parts[:-1]))
+    dir_path = Path(*parts[:-1]).as_posix()
     return dir_path + "/"
 
 

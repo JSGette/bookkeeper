@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import logging
-import math
 import re
 import sqlite3
 import tempfile
 import threading
-import time
 from pathlib import Path
 
 import hnswlib
@@ -27,27 +25,23 @@ log = logging.getLogger(__name__)
 RRF_K = 10
 _RERANK_PASSAGE_CHARS = 2000
 
-# Score → confidence band. Thresholds chosen empirically from the audit log:
-# the BGE reranker outputs ~0.5 for "no clear match" and ~0.7+ for strong
-# matches. RRF scores live on a different scale (0–0.1 typical) because they
-# are sums of 1/(k+rank) over two retrievers.
+# Reranker bands remain heuristics, not calibrated probabilities. RRF is
+# ranking-only: its magnitude changes with k even when relevance does not.
 _RERANK_HIGH = 0.6
 _RERANK_LOW = 0.4
-_RRF_HIGH = 0.04
-_RRF_LOW = 0.015
 
 
-def _confidence_for(score: float, score_kind: str) -> str:
+def _confidence_for(
+    score: float, score_kind: str, *, cosine: float | None = None,
+    lexical_support: bool = False,
+) -> str:
     if score_kind == "rerank":
         if score >= _RERANK_HIGH:
             return "high"
         if score >= _RERANK_LOW:
             return "medium"
         return "low"
-    # rrf (and the future "cached" branch reuses the original kind anyway)
-    if score >= _RRF_HIGH:
-        return "high"
-    if score >= _RRF_LOW:
+    if cosine is not None and cosine >= 0.5 and lexical_support:
         return "medium"
     return "low"
 
@@ -64,6 +58,7 @@ class Searcher:
         reranker_model: str = "BAAI/bge-reranker-base",
         reranker_pool_multiplier: int = 6,
         rrf_k: int = RRF_K,
+        expected_embedding_profile: dict | None = None,
     ):
         self.conn = conn
         self._vectors: np.ndarray | None = None
@@ -75,10 +70,13 @@ class Searcher:
         self._reranker_model = reranker_model
         self._reranker_pool_multiplier = max(1, reranker_pool_multiplier)
         self._rrf_k = max(1, rrf_k)
-        # Serialises load()/reload(). Without this, every Cursor window
-        # racing the daemon's first-call gate fires a parallel index build
-        # and they pile up on the SQLite connection mutex for minutes.
-        self._load_lock = threading.Lock()
+        self._embedding_profile = expected_embedding_profile
+        self._normalized_vectors: np.ndarray | None = None
+        self._dense_eligible = np.array([], dtype=bool)
+        self._index_fingerprint: str | None = None
+        self.loaded_generation: int | None = None
+        # Query and load must see the same metadata, vectors and index generation.
+        self._load_lock = threading.RLock()
 
     def _build_bm25(self) -> None:
         if not self._metadata:
@@ -96,35 +94,38 @@ class Searcher:
             tag_tokens = _tokenize(" ".join(m.get("tags", [])))
             tokens = title_tokens + heading_tokens + tag_tokens + tokens
             corpus.append(tokens)
-        self._bm25 = BM25Okapi(corpus)
+        self._bm25 = BM25Okapi(corpus) if any(corpus) else None
 
     def _build_hnsw(self) -> None:
         """Build hnswlib index from vectors. Try loading cached blob first."""
         self._hnsw = None
-        if self._vectors is None or len(self._vectors) == 0:
+        if (self._vectors is None or self._vectors.size == 0
+                or not np.all(self._dense_eligible)):
             return
 
         dim = self._vectors.shape[1]
         n = len(self._vectors)
 
-        cached = db.load_hnsw_cache(self.conn)
+        cached = db.load_hnsw_cache(self.conn, fingerprint=self._index_fingerprint)
         if cached is not None:
             blob, cached_count = cached
             if cached_count == n:
+                tmp_path = None
                 try:
                     index = hnswlib.Index(space="cosine", dim=dim)
                     with tempfile.NamedTemporaryFile(suffix=".hnsw", delete=False) as f:
                         f.write(blob)
                         tmp_path = f.name
                     index.load_index(tmp_path, max_elements=n)
-                    Path(tmp_path).unlink(missing_ok=True)
                     index.set_ef(50)
                     self._hnsw = index
                     log.info("Loaded cached hnswlib index (%d vectors)", n)
                     return
                 except Exception as exc:
                     log.warning("Failed to load cached HNSW, rebuilding: %s", exc)
-                    Path(tmp_path).unlink(missing_ok=True)
+                finally:
+                    if tmp_path:
+                        Path(tmp_path).unlink(missing_ok=True)
 
         # Build fresh
         index = hnswlib.Index(space="cosine", dim=dim)
@@ -140,31 +141,41 @@ class Searcher:
         """Serialize current HNSW index and store in DB."""
         if self._hnsw is None or self._vectors is None:
             return
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".hnsw", delete=False) as f:
                 tmp_path = f.name
             self._hnsw.save_index(tmp_path)
             blob = Path(tmp_path).read_bytes()
-            Path(tmp_path).unlink(missing_ok=True)
-            db.save_hnsw_cache(self.conn, blob, len(self._vectors))
+            db.save_hnsw_cache(self.conn, blob, len(self._vectors), fingerprint=self._index_fingerprint)
         except Exception as exc:
             log.warning("Failed to cache HNSW index: %s", exc)
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
     def load(self) -> bool:
         with self._load_lock:
             return self._load_locked()
 
     def _load_locked(self) -> bool:
-        meta, vecs = db.load_all_chunks(self.conn)
-        if not meta:
-            log.warning("No chunks in database")
-            self._vectors = np.empty((0, 384), dtype=np.float32)
-            self._metadata = []
-            self._deprecated = db.load_deprecated(self.conn)
-            return False
+        with db.transaction(self.conn):
+            meta, vecs = db.load_all_chunks(self.conn, embedding_profile=self._embedding_profile)
+            deprecated = db.load_deprecated(self.conn)
+            generation = db.corpus_generation(self.conn)
         self._vectors = vecs
         self._metadata = meta
-        self._deprecated = db.load_deprecated(self.conn)
+        self._deprecated = deprecated
+        self.loaded_generation = generation
+        self._dense_eligible = np.array([m.get("dense_eligible", True) for m in meta], dtype=bool)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        self._normalized_vectors = vecs / np.where(norms == 0, 1, norms)
+        self._index_fingerprint = db.index_fingerprint(meta, vecs)
+        if not meta:
+            log.warning("No chunks in database")
+            self._bm25 = None
+            self._hnsw = None
+            return False
         self._build_bm25()
         self._build_hnsw()
         log.info("Loaded index: %d chunks, %d deprecated docs", len(meta), len(self._deprecated))
@@ -175,16 +186,16 @@ class Searcher:
 
     @property
     def chunk_count(self) -> int:
-        return len(self._metadata) if self._metadata else 0
+        with self._load_lock:
+            return len(self._metadata) if self._metadata else 0
 
     def source_stats(self) -> dict[str, int]:
-        if not self._metadata:
-            return {}
-        counts: dict[str, int] = {}
-        for m in self._metadata:
-            src = m.get("source", "unknown")
-            counts[src] = counts.get(src, 0) + 1
-        return counts
+        with self._load_lock:
+            counts: dict[str, int] = {}
+            for m in self._metadata or []:
+                src = m.get("source", "unknown")
+                counts[src] = counts.get(src, 0) + 1
+            return counts
 
     def embed_query(self, query_text: str) -> np.ndarray:
         """Public hook so callers (e.g. the dedupe pre-check) can reuse the
@@ -199,11 +210,16 @@ class Searcher:
         query_vec: np.ndarray | None = None,
     ) -> list[tuple[int, int]]:
         """Return [(index, rank)] from vector similarity. Uses HNSW when no source filter."""
-        if self._vectors is None or self._metadata is None or len(self._vectors) == 0:
+        if (self._vectors is None or self._metadata is None or self._vectors.size == 0
+                or not np.any(self._dense_eligible) or n <= 0):
             return []
 
         if query_vec is None:
             query_vec = embed_texts([query_text])[0]
+        query_vec = np.asarray(query_vec, dtype=np.float32)
+        if (query_vec.shape != (self._vectors.shape[1],) or not np.all(np.isfinite(query_vec))
+                or not np.linalg.norm(query_vec)):
+            return []
 
         if self._hnsw is not None and source is None:
             labels, _distances = self._hnsw.knn_query(
@@ -212,22 +228,19 @@ class Searcher:
             return [(int(labels[0][i]), i) for i in range(len(labels[0]))]
 
         # Brute-force fallback for source-filtered queries
-        norms = np.linalg.norm(self._vectors, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1, norms)
-        normed = self._vectors / norms
         query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
-
-        scores = normed @ query_norm
+        scores = self._normalized_vectors @ query_norm
+        scores = np.where(self._dense_eligible, scores, -np.inf)
 
         if source:
             mask = np.array([m.get("source") == source for m in self._metadata])
-            scores = np.where(mask, scores, -1.0)
+            scores = np.where(mask, scores, -np.inf)
 
         top_indices = np.argsort(scores)[::-1][:n]
         return [(int(idx), rank) for rank, idx in enumerate(top_indices) if scores[idx] >= 0]
 
     def _bm25_search(self, query_text: str, n: int, source: str | None) -> list[tuple[int, int]]:
-        if self._bm25 is None or self._metadata is None:
+        if self._bm25 is None or self._metadata is None or n <= 0:
             return []
 
         tokens = _tokenize(query_text)
@@ -235,13 +248,16 @@ class Searcher:
             return []
 
         scores = self._bm25.get_scores(tokens)
-
+        # Common terms can have nonpositive BM25 IDF in tiny corpora. Token
+        # overlap still supplies lexical evidence; score sign is not relevance.
+        eligible = np.array([any(t in freq for t in tokens) for freq in self._bm25.doc_freqs])
         if source:
             mask = np.array([m.get("source") == source for m in self._metadata])
-            scores = np.where(mask, scores, -1.0)
+            eligible &= mask
+        scores = np.where(eligible, scores, -np.inf)
 
         top_indices = np.argsort(scores)[::-1][:n]
-        return [(int(idx), rank) for rank, idx in enumerate(top_indices) if scores[idx] > 0]
+        return [(int(idx), rank) for rank, idx in enumerate(top_indices) if eligible[idx]]
 
     def _rrf_fuse(
         self,
@@ -280,7 +296,7 @@ class Searcher:
         needed so audit logs can distinguish reranker-scored rows from silent
         RRF fallbacks that happen to land in the same numeric range.
         """
-        if not self._reranker_enabled or len(fused_indices) <= 1 or self._metadata is None:
+        if not self._reranker_enabled or not fused_indices or self._metadata is None:
             return fused_indices, rrf_scores, False
 
         passages = [self._passage_for_rerank(i) for i in fused_indices]
@@ -323,16 +339,32 @@ class Searcher:
         meta keys: reranker_used (bool), rrf_k (int), score_kind ("rerank"|"rrf"),
         confidence ("high"|"medium"|"low"|"none"), weak_match (bool).
         """
+        with self._load_lock:
+            return self._query_locked(
+                query_text, top_k, source, score_threshold_z, min_results, query_embedding,
+            )
+
+    def _query_locked(
+        self, query_text: str, top_k: int, source: str | None,
+        score_threshold_z: float, min_results: int,
+        query_embedding: np.ndarray | None,
+    ) -> tuple[list[dict], dict]:
         query_meta = {
             "reranker_used": False,
             "rrf_k": self._rrf_k,
             "score_kind": "rrf",
             "confidence": "none",
             "weak_match": True,
+            "generation": self.loaded_generation,
+            "confidence_calibrated": False,
         }
-        if self._vectors is None or self._metadata is None or len(self._metadata) == 0:
+        if self._vectors is None or not self._metadata or top_k <= 0:
             return [], query_meta
 
+        if query_embedding is None and self._vectors.size and np.any(self._dense_eligible):
+            query_embedding = self.embed_query(query_text)
+        if query_embedding is not None:
+            query_embedding = np.asarray(query_embedding, dtype=np.float32)
         rerank_pool = top_k * self._reranker_pool_multiplier if self._reranker_enabled else top_k
         candidate_n = max(top_k * 3, rerank_pool)
         vector_results = self._vector_search(query_text, candidate_n, source, query_vec=query_embedding)
@@ -344,21 +376,6 @@ class Searcher:
             query_meta["reranker_used"] = True
             query_meta["score_kind"] = "rerank"
         fused_indices = fused_indices[:top_k]
-
-        # Freshness boost — scaled so it's a tiebreaker regardless of score origin.
-        # RRF scores sit near 1/60; reranker sigmoid scores sit in [0,1]. 0.01 nudges
-        # either without overriding substantive relevance differences.
-        boost_scale = 0.01 if self._reranker_enabled else 0.005
-        now = time.time()
-        for idx in fused_indices:
-            indexed_at = self._metadata[idx].get("indexed_at", "")
-            if indexed_at:
-                try:
-                    ts = time.mktime(time.strptime(indexed_at, "%Y-%m-%dT%H:%M:%SZ"))
-                    age_hours = max(0, (now - ts) / 3600)
-                    scores[idx] += boost_scale * math.exp(-age_hours / (24 * 7))
-                except (ValueError, OverflowError):
-                    pass
 
         if len(fused_indices) > 1:
             scores_arr = np.array([scores[i] for i in fused_indices])
@@ -374,23 +391,65 @@ class Searcher:
 
         results = []
         session_groups: dict[str, dict] = {}
+        query_tokens = set(_tokenize(query_text))
 
         for idx in fused_indices:
             meta = self._metadata[idx]
             text = meta.get("text", "")
             doc_path = meta.get("path", "")
             src = meta.get("source", "")
+            span = {
+                "evidence_id": meta.get("evidence_id"),
+                "revision_id": meta.get("revision_id"),
+                "completeness": meta.get("completeness", "unknown"),
+                "text": text,
+                "start_line": meta.get("start_line", 0),
+                "end_line": meta.get("end_line", 0),
+            }
+            cosine = None
+            if (query_embedding is not None and self._dense_eligible[idx]
+                    and query_embedding.shape == (self._vectors.shape[1],)
+                    and np.all(np.isfinite(query_embedding))):
+                query_norm = np.linalg.norm(query_embedding)
+                if query_norm:
+                    cosine = float(self._normalized_vectors[idx] @ (query_embedding / query_norm))
+            lexical_support = bool(query_tokens.intersection(_tokenize(
+                " ".join([text, meta.get("doc_title", ""), meta.get("section_heading", "")]),
+            )))
+            common = {
+                "evidence_id": span["evidence_id"],
+                "revision_id": span["revision_id"],
+                "completeness": span["completeness"],
+                "evidence": text,
+                "evidence_spans": [span],
+                "confidence": _confidence_for(
+                    scores[idx], query_meta["score_kind"], cosine=cosine,
+                    lexical_support=lexical_support,
+                ),
+                "cosine_similarity": cosine,
+                "lexical_support": lexical_support,
+                "trust": "untrusted_source",
+            }
+            if doc_path in self._deprecated:
+                common["deprecated"] = True
+                common["deprecation_notice"] = (
+                    "HISTORICAL CONTEXT ONLY — this doc has been marked as outdated: "
+                    f"{self._deprecated[doc_path]}. Do not treat claims in this doc as current facts."
+                )
 
             if src == "sessions":
                 turn_label = meta.get("section_heading", "")
                 if doc_path in session_groups:
                     group = session_groups[doc_path]
                     if turn_label:
-                        group["matched_turns"].append(turn_label)
+                        group.setdefault("matched_turns", []).append(turn_label)
                     group["score"] = max(group["score"], round(rrf_scores[idx], 4))
+                    group["evidence_spans"].append(span)
+                    group["evidence"] += "\n\n" + text
                     continue
 
                 session_groups[doc_path] = {
+                    **common,
                     "source": "sessions",
                     "path": doc_path,
                     "score": round(rrf_scores[idx], 4),
@@ -410,6 +469,7 @@ class Searcher:
                 continue
 
             result: dict = {
+                **common,
                 "source": src,
                 "path": doc_path,
                 "score": round(rrf_scores[idx], 4),
@@ -428,14 +488,6 @@ class Searcher:
                 doc_context = meta.get("doc_preamble", "")
                 result["summary"] = doc_context or text[:500]
 
-            deprecation_reason = self._deprecated.get(doc_path)
-            if deprecation_reason:
-                result["deprecated"] = True
-                result["deprecation_notice"] = (
-                    f"HISTORICAL CONTEXT ONLY — this doc has been marked as outdated: "
-                    f"{deprecation_reason}. Do not treat claims in this doc as current facts."
-                )
-
             results.append(result)
 
         results = self._group_document_results(results)
@@ -444,9 +496,6 @@ class Searcher:
             results.append(group)
         results.sort(key=lambda r: r.get("score", 0), reverse=True)
 
-        score_kind = query_meta["score_kind"]
-        for r in results:
-            r["confidence"] = _confidence_for(r.get("score", 0.0), score_kind)
         if results:
             top_band = results[0]["confidence"]
             query_meta["confidence"] = top_band
@@ -480,19 +529,15 @@ class Searcher:
             last_line = max((r.get("end_line") or 0) for r in items) or 0
 
             merged_result: dict = {
-                "source": _src,
-                "path": _path,
-                "score": best["score"],
-                "tags": best.get("tags", []),
-                "description": best.get("description", ""),
-                "indexed_at": best.get("indexed_at", ""),
-                "summary": best.get("summary", ""),
+                **best,
                 "matched_sections": all_sections,
                 "start_line": first_line,
                 "end_line": last_line,
                 "merged_chunks": len(items),
+                "evidence": "\n\n".join(r["evidence"] for r in items if "evidence" in r),
+                "evidence_spans": [span for r in items for span in r.get("evidence_spans", [])],
             }
-            dep = best.get("deprecation_notice")
+            dep = next((r.get("deprecation_notice") for r in items if r.get("deprecated")), None)
             if dep:
                 merged_result["deprecated"] = True
                 merged_result["deprecation_notice"] = dep

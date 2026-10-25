@@ -5,10 +5,13 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+from bisect import bisect_right
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 _DEFAULT_MAX_CHUNK_TOKENS = 512
+TokenCounter = Callable[[str], int]
 
 # Lazy-loaded tiktoken encoder for accurate token counting
 _enc = None
@@ -34,9 +37,13 @@ class Chunk:
     tags: list[str] = field(default_factory=list)
     description: str = ""
     doc_preamble: str = ""
+    # Only the embedding prefix is shortened; source text and metadata stay intact.
+    _embedding_prefix: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def embedding_text(self) -> str:
+        if self._embedding_prefix is not None:
+            return _with_prefix(self._embedding_prefix, self.text)
         prefix = self.doc_title
         if self.doc_preamble:
             prefix += f" | {self.doc_preamble[:200]}"
@@ -73,7 +80,115 @@ def _estimate_tokens(text: str) -> int:
     if _enc is None:
         import tiktoken
         _enc = tiktoken.get_encoding("cl100k_base")
-    return len(_enc.encode(text))
+    return len(_enc.encode(text, disallowed_special=()))
+
+
+def _with_prefix(prefix: str, text: str) -> str:
+    return f"{prefix}\n{text}" if prefix else text
+
+
+def _fit_end(text: str, start: int, stop: int, fits: Callable[[str], bool], hint: int) -> int:
+    """Find a fitting Unicode boundary without decoding partial token byte strings.
+
+    Token counts are not strictly monotonic. The returned candidate is always
+    checked, although it need not be the longest possible fitting prefix.
+    """
+    low = start
+    high = min(stop, start + max(1, hint))
+    while fits(text[start:high]):
+        low = high
+        if high == stop:
+            return high
+        high = min(stop, start + 2 * (high - start))
+    while high - low > 1:
+        middle = (low + high) // 2
+        if fits(text[start:middle]):
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+def _split_spans(
+    text: str, max_tokens: int, count_tokens: TokenCounter,
+    *, prefix: str = "", embedding_max_tokens: int | None = None,
+    overlap_lines: int = 0,
+) -> Iterator[tuple[int, int]]:
+    """Yield exact source slices, preferring paragraphs and then line boundaries."""
+    if max_tokens <= 0 or (embedding_max_tokens is not None and embedding_max_tokens <= 0):
+        raise ValueError("Token limits must be positive")
+
+    def fits(part: str) -> bool:
+        return count_tokens(part) <= max_tokens and (
+            embedding_max_tokens is None
+            or count_tokens(_with_prefix(prefix, part)) <= embedding_max_tokens
+        )
+
+    start = 0
+    hint = min(max_tokens, embedding_max_tokens or max_tokens)
+    while start < len(text):
+        end = _fit_end(text, start, len(text), fits, hint)
+        if end == start:
+            raise ValueError("Token limit is too small to preserve a source character")
+        if end < len(text):
+            window = text[start:end]
+            for pattern in (r"\n\n+", r"\n", r"\s+"):
+                boundaries = [m.end() for m in re.finditer(pattern, window)
+                              if m.end() >= len(window) // 2]
+                candidate = next((start + boundary for boundary in reversed(boundaries)
+                                  if fits(text[start:start + boundary])), None)
+                if candidate is not None:
+                    end = candidate
+                    break
+        yield start, end
+        if end == len(text):
+            break
+        if overlap_lines:
+            # Retain at most N complete lines, always making forward progress.
+            line_starts = [m.end() + start for m in re.finditer(r"\n", text[start:end])
+                           if m.end() + start < end]
+            start = line_starts[max(0, len(line_starts) - overlap_lines)] if line_starts else end
+        else:
+            start = end
+
+
+def _bounded_prefix(chunk: Chunk, count_tokens: TokenCounter, limit: int | None) -> str | None:
+    if limit is None:
+        return None
+    if limit <= 0:
+        raise ValueError("Token limits must be positive")
+    prefix = chunk.embedding_text.removesuffix("\n" + chunk.text)
+    # Reserve most of the input for evidence. The final combined string is
+    # checked independently because tokenizers include special-token overhead.
+    budget = limit // 4
+    end = _fit_end(prefix, 0, len(prefix), lambda p: count_tokens(p + "\n") <= budget, budget)
+    return prefix[:end]
+
+
+def _section_chunks(
+    content: str, source: str, rel_path: str, title: str,
+    sections: list[tuple[str, int, int]], max_tokens: int,
+    count_tokens: TokenCounter, embedding_max_tokens: int | None,
+    *, preamble: str = "", overlap_lines: int = 0,
+) -> list[Chunk]:
+    line_starts = [0] + [m.end() for m in re.finditer(r"\n", content)]
+    chunks = []
+    for heading, start, end in sections:
+        template = Chunk(source, rel_path, title, heading, 0, 0, "", doc_preamble=preamble)
+        prefix = _bounded_prefix(template, count_tokens, embedding_max_tokens)
+        section = content[start:end]
+        for part_start, part_end in _split_spans(
+            section, max_tokens, count_tokens, prefix=prefix or "",
+            embedding_max_tokens=embedding_max_tokens, overlap_lines=overlap_lines,
+        ):
+            first_line = bisect_right(line_starts, start + part_start)
+            last_line = bisect_right(line_starts, start + part_end - 1)
+            chunks.append(Chunk(
+                source, rel_path, title, heading, first_line, last_line,
+                section[part_start:part_end], doc_preamble=preamble,
+                _embedding_prefix=prefix,
+            ))
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -89,125 +204,76 @@ def _extract_title(lines: list[str]) -> str:
 
 
 def _split_oversized(text: str, heading: str, max_tokens: int) -> list[str]:
-    """Split text that exceeds max_tokens at ### boundaries, then paragraph boundaries."""
-    if _estimate_tokens(text) <= max_tokens:
-        return [text]
-
-    # Try splitting at ### headings
-    parts = re.split(r"(?=^###\s+)", text, flags=re.MULTILINE)
-    if len(parts) > 1:
-        result = []
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            if _estimate_tokens(part) <= max_tokens:
-                result.append(part)
-            else:
-                result.extend(_split_by_paragraphs(part, max_tokens))
-        return result
-
+    """Split oversized text without dropping whitespace or Unicode characters."""
     return _split_by_paragraphs(text, max_tokens)
 
 
 def _split_by_paragraphs(text: str, max_tokens: int) -> list[str]:
-    """Split text at paragraph boundaries (double newlines) with overlap."""
-    paragraphs = re.split(r"\n\n+", text)
-    chunks = []
-    current: list[str] = []
-    current_tokens = 0
-    max_overlap_tokens = 50
-
-    for para in paragraphs:
-        para_tokens = _estimate_tokens(para)
-        if current_tokens + para_tokens > max_tokens and current:
-            chunk_text = "\n\n".join(current)
-            chunks.append(chunk_text)
-            overlap = current[-1] if current else ""
-            current = [overlap] if _estimate_tokens(overlap) < max_overlap_tokens else []
-            current_tokens = _estimate_tokens("\n\n".join(current))
-        current.append(para)
-        current_tokens += para_tokens
-
-    if current:
-        chunks.append("\n\n".join(current))
-    return chunks or [text]
+    """Split at natural boundaries, with a hard fallback inside long paragraphs."""
+    return [text[start:end] for start, end in _split_spans(text, max_tokens, _estimate_tokens)]
 
 
 def chunk_markdown(
     source: str, root: Path, rel_path: str, max_tokens: int,
     max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS,
+    *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+    content: str | None = None,
 ) -> list[Chunk]:
     full_path = root / rel_path
-    try:
-        content = full_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if content is None:
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+
+    lines = content.splitlines(keepends=True)
+    if not content.strip():
         return []
 
-    lines = content.splitlines()
-    if not lines:
-        return []
-
+    counter = count_tokens or _estimate_tokens
     doc_title = _extract_title(lines) or Path(rel_path).stem
 
-    # Small-document bypass: return whole doc as a single chunk
-    if max_whole_doc_tokens > 0 and _estimate_tokens(content) <= max_whole_doc_tokens:
-        return [Chunk(
-            source=source, path=rel_path, doc_title=doc_title,
-            section_heading="", start_line=1, end_line=len(lines),
-            text=content.strip(),
-        )]
+    # The whole-document preference must never override either hard limit.
+    if max_whole_doc_tokens > 0 and counter(content) <= min(max_whole_doc_tokens, max_tokens):
+        whole = _section_chunks(content, source, rel_path, doc_title, [("", 0, len(content))],
+                                max_tokens, counter, embedding_max_tokens)
+        if len(whole) == 1:
+            return whole
 
     sections: list[tuple[str, int]] = []
-    for i, line in enumerate(lines):
-        if re.match(r"^##\s+", line):
+    offset = 0
+    fence = ""
+    fence_length = 0
+    for line in lines:
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            run = marker.group(1)
+            if not fence:
+                fence, fence_length = run[0], len(run)
+            elif run[0] == fence and len(run) >= fence_length and not line[marker.end():].strip():
+                fence = ""
+            offset += len(line)
+            continue
+        if not fence and re.match(r"^##\s+", line):
             heading = re.sub(r"^##\s+", "", line).strip()
-            sections.append((heading, i))
+            sections.append((heading, offset))
+        offset += len(line)
 
     # Extract preamble: text between # title and first ## heading (or end of doc)
     preamble = ""
     if sections and sections[0][1] > 0:
-        raw = "\n".join(lines[: sections[0][1]]).strip()
-        # Strip the title line itself, keep remaining text
-        preamble_lines_raw = raw.split("\n", 1)
-        if len(preamble_lines_raw) > 1:
-            preamble = preamble_lines_raw[1].strip()
-
-    chunks = []
+        raw = content[:sections[0][1]]
+        preamble = re.sub(r"^#\s+[^\n]*(?:\n|$)", "", raw, count=1, flags=re.MULTILINE).strip()
 
     if not sections:
-        for part in _split_oversized(content, "", max_tokens):
-            chunks.append(Chunk(
-                source=source, path=rel_path, doc_title=doc_title,
-                section_heading="", start_line=1, end_line=len(lines),
-                text=part, doc_preamble=preamble,
-            ))
-        return chunks
+        sections = [("", 0)]
 
     if sections[0][1] > 0:
-        preamble_lines = lines[: sections[0][1]]
-        preamble_text = "\n".join(preamble_lines).strip()
-        if preamble_text and len(preamble_lines) > 2:
-            for part in _split_oversized(preamble_text, "", max_tokens):
-                chunks.append(Chunk(
-                    source=source, path=rel_path, doc_title=doc_title,
-                    section_heading="", start_line=1, end_line=sections[0][1],
-                    text=part, doc_preamble=preamble,
-                ))
-
-    for idx, (heading, start) in enumerate(sections):
-        end = sections[idx + 1][1] if idx + 1 < len(sections) else len(lines)
-        section_text = "\n".join(lines[start:end]).strip()
-        if not section_text:
-            continue
-        for part in _split_oversized(section_text, heading, max_tokens):
-            chunks.append(Chunk(
-                source=source, path=rel_path, doc_title=doc_title,
-                section_heading=heading, start_line=start + 1, end_line=end,
-                text=part, doc_preamble=preamble,
-            ))
-
-    return chunks
+        sections.insert(0, ("", 0))
+    spans = [(heading, start, sections[i + 1][1] if i + 1 < len(sections) else len(content))
+             for i, (heading, start) in enumerate(sections)]
+    return _section_chunks(content, source, rel_path, doc_title, spans, max_tokens,
+                           counter, embedding_max_tokens, preamble=preamble)
 
 
 # ---------------------------------------------------------------------------
@@ -241,53 +307,58 @@ def _try_treesitter_chunk(content: str, source: str, rel_path: str, max_tokens: 
     return chunks if chunks else None
 
 
-def chunk_code(source: str, root: Path, rel_path: str, max_tokens: int) -> list[Chunk]:
+def chunk_code(
+    source: str, root: Path, rel_path: str, max_tokens: int,
+    *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+    content: str | None = None,
+) -> list[Chunk]:
     """Chunk source code files. Uses treesitter if available, else fixed-size."""
     full_path = root / rel_path
-    try:
-        content = full_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+    if content is None:
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
 
     if not content.strip():
         return []
 
     ts_result = _try_treesitter_chunk(content, source, rel_path, max_tokens)
     if ts_result is not None:
-        return ts_result
-
-    return _chunk_fixed_size(content, source, rel_path, max_tokens)
-
-
-def _chunk_fixed_size(content: str, source: str, rel_path: str, max_tokens: int) -> list[Chunk]:
-    """Fixed-size chunking with overlap for any file type."""
-    doc_title = Path(rel_path).stem
-    lines = content.splitlines()
-    overlap_lines = 10
-    chunks = []
-
-    start = 0
-    while start < len(lines):
-        end = start
-        token_count = 0
-        while end < len(lines):
-            line_tokens = _estimate_tokens(lines[end])
-            if token_count + line_tokens >= max_tokens:
+        # Third-party chunkers may exceed the cap or omit separators. Recover
+        # their boundaries from the source and include every intervening character.
+        cursor = 0
+        sections = []
+        for chunk in ts_result:
+            position = content.find(chunk.text, cursor)
+            if not chunk.text or position < 0:
                 break
-            token_count += line_tokens
-            end += 1
-        if end == start:
-            end = start + 1
+            end = position + len(chunk.text)
+            sections.append((chunk.section_heading, cursor, end))
+            cursor = end
+        else:
+            if sections:
+                heading, start, _ = sections[-1]
+                sections[-1] = (heading, start, len(content))
+                return _section_chunks(content, source, rel_path, Path(rel_path).stem, sections,
+                                       max_tokens, count_tokens or _estimate_tokens, embedding_max_tokens)
 
-        chunk_text = "\n".join(lines[start:end])
-        chunks.append(Chunk(
-            source=source, path=rel_path, doc_title=doc_title,
-            section_heading=f"lines_{start + 1}_{end}",
-            start_line=start + 1, end_line=end,
-            text=chunk_text,
-        ))
-        start = max(start + 1, end - overlap_lines)
+    return _chunk_fixed_size(content, source, rel_path, max_tokens,
+                            count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens)
 
+
+def _chunk_fixed_size(
+    content: str, source: str, rel_path: str, max_tokens: int,
+    *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+) -> list[Chunk]:
+    """Bounded source slices with line overlap, including oversized single lines."""
+    chunks = _section_chunks(content, source, rel_path, Path(rel_path).stem,
+                             [("", 0, len(content))], max_tokens,
+                             count_tokens or _estimate_tokens, embedding_max_tokens, overlap_lines=10)
+    for chunk in chunks:
+        chunk.section_heading = f"lines_{chunk.start_line}_{chunk.end_line}"
+        # A bounded prefix is deliberately fixed before splitting, so adding
+        # display-only line metadata cannot exceed the embedding limit.
     return chunks
 
 
@@ -299,25 +370,34 @@ def chunk_file(
     source: str, root: Path, rel_path: str,
     max_tokens: int = _DEFAULT_MAX_CHUNK_TOKENS,
     max_whole_doc_tokens: int = _DEFAULT_MAX_WHOLE_DOC_TOKENS,
+    *, count_tokens: TokenCounter | None = None, embedding_max_tokens: int | None = None,
+    content: str | None = None,
 ) -> list[Chunk]:
-    """Chunk a single file, dispatching by extension."""
+    """Chunk a file; optional counter and full-input limit match its embedding model."""
     ext = Path(rel_path).suffix.lower()
     if ext in _MD_EXTENSIONS:
-        return chunk_markdown(source, root, rel_path, max_tokens, max_whole_doc_tokens)
+        return chunk_markdown(source, root, rel_path, max_tokens, max_whole_doc_tokens,
+                              count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens, content=content)
     elif ext in _CODE_EXTENSIONS:
-        return chunk_code(source, root, rel_path, max_tokens)
+        return chunk_code(source, root, rel_path, max_tokens,
+                          count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens, content=content)
     else:
         full_path = root / rel_path
-        try:
-            content = full_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return []
+        if content is None:
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return []
         if content.strip():
-            return _chunk_fixed_size(content, source, rel_path, max_tokens)
+            return _chunk_fixed_size(content, source, rel_path, max_tokens,
+                                    count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens)
         return []
 
 
-def chunk_source(source_cfg: SourceConfig) -> list[Chunk]:
+def chunk_source(
+    source_cfg: SourceConfig, *, count_tokens: TokenCounter | None = None,
+    embedding_max_tokens: int | None = None,
+) -> list[Chunk]:
     root = Path(os.path.expanduser(source_cfg.path))
     if not root.is_dir():
         return []
@@ -343,6 +423,7 @@ def chunk_source(source_cfg: SourceConfig) -> list[Chunk]:
         all_chunks.extend(chunk_file(
             source_cfg.name, root, rel, source_cfg.max_chunk_tokens,
             source_cfg.max_whole_doc_tokens,
+            count_tokens=count_tokens, embedding_max_tokens=embedding_max_tokens,
         ))
 
     return all_chunks

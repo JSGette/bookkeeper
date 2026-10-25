@@ -11,7 +11,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 from . import db
-from .config import load_config
+from .config import load_config, resolve_database_path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ class Handler(SimpleHTTPRequestHandler):
     @classmethod
     def get_conn(cls):
         if cls._conn is None:
-            cls._conn = db.init_db(cls.db_path)
+            cls._conn = db.init_db(cls.db_path, allow_legacy_upgrade=False)
         return cls._conn
 
     def do_GET(self):  # noqa: N802
@@ -110,8 +110,8 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config()
-    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/bookkeeper"))
-    Handler.db_path = os.path.join(cache_dir, "bookkeeper.db")
+    Handler.db_path = resolve_database_path(config)
+    Handler.get_conn()  # Fail before serving if explicit legacy migration is required.
 
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     log.info("Serving on http://127.0.0.1:%d  (db=%s)", args.port, Handler.db_path)

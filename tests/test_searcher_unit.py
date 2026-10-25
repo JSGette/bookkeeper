@@ -1,14 +1,18 @@
-"""Unit tests for searcher.py internals: RRF fusion, grouping, freshness boost, session collapse."""
+"""Unit tests for search generations, evidence grouping and relevance scoring."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
+from agents_rag import db
 from agents_rag.db import init_db, upsert_chunks, upsert_document
 from agents_rag.searcher import Searcher, _confidence_for, _tokenize
 
@@ -141,7 +145,8 @@ def test_group_keeps_different_docs(tmp_path):
 def _fake_embed(texts):
     vecs = []
     for t in texts:
-        rng = np.random.RandomState(hash(t) % (2**31))
+        seed = int.from_bytes(hashlib.sha256(t.encode("utf-8")).digest()[:4], "little")
+        rng = np.random.RandomState(seed)
         vecs.append(rng.randn(384).astype(np.float32))
     return np.array(vecs)
 
@@ -184,12 +189,12 @@ def test_session_grouping_collapses_turns(mock_embed, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Freshness boost
+# Dates do not change relevance
 # ---------------------------------------------------------------------------
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
-def test_freshness_boost_favors_recent(mock_embed, tmp_path):
+def test_recent_indexing_does_not_boost_relevance_or_confidence(mock_embed, tmp_path):
     conn = init_db(str(tmp_path / "test.db"))
 
     old_time = "2024-01-01T00:00:00Z"
@@ -213,11 +218,13 @@ def test_freshness_boost_favors_recent(mock_embed, tmp_path):
     upsert_chunks(conn, doc_old, [old_chunk], _fake_embed(["bazel migration plan details"]))
     upsert_chunks(conn, doc_new, [new_chunk], _fake_embed(["bazel migration plan details"]))
 
-    searcher = Searcher(conn)
+    searcher = Searcher(conn, reranker_enabled=True)
     searcher.load()
-    results = searcher.query("bazel migration", top_k=5)
-    # Both should appear; we just verify the boost doesn't crash
-    assert len(results) >= 1
+    with patch("agents_rag.searcher._rerank_fn", return_value=np.array([0.395, 0.395])):
+        results = searcher.query("bazel migration", top_k=5, min_results=2)
+    assert len(results) == 2
+    assert all(r["score"] == pytest.approx(0.395) for r in results)
+    assert all(r["confidence"] == "low" for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -456,13 +463,12 @@ def test_confidence_for_rerank_thresholds():
     assert _confidence_for(0.0, "rerank") == "low"
 
 
-def test_confidence_for_rrf_thresholds():
-    assert _confidence_for(0.05, "rrf") == "high"
-    assert _confidence_for(0.04, "rrf") == "high"
-    assert _confidence_for(0.02, "rrf") == "medium"
-    assert _confidence_for(0.015, "rrf") == "medium"
-    assert _confidence_for(0.01, "rrf") == "low"
-    assert _confidence_for(0.0, "rrf") == "low"
+@pytest.mark.parametrize("rank_score", [0.0, 0.015, 0.04, 0.1, 2.0])
+def test_rrf_rank_alone_never_claims_relevance(rank_score):
+    assert _confidence_for(rank_score, "rrf") == "low"
+    assert _confidence_for(rank_score, "rrf", cosine=0.9) == "low"
+    assert _confidence_for(rank_score, "rrf", cosine=0.0, lexical_support=True) == "low"
+    assert _confidence_for(rank_score, "rrf", cosine=0.9, lexical_support=True) == "medium"
 
 
 @patch("agents_rag.searcher.embed_texts", side_effect=_fake_embed)
@@ -606,3 +612,176 @@ def test_bm25_scores_body_match_above_title_only_match(mock_embed, tmp_path):
     assert bm25_hits, "expected at least one BM25 match"
     top_idx = bm25_hits[0][0]
     assert searcher._metadata[top_idx]["path"] == "body_match.md"
+
+
+def _insert_vector_doc(conn, path, text, vector, *, source="docs", space=None):
+    doc_id = upsert_document(conn, source, path, path, "", text)
+    chunk = {"text": text, "section_heading": "Evidence", "tags": [],
+             "start_line": 3, "end_line": 5}
+    upsert_chunks(conn, doc_id, [chunk], np.array([vector], dtype=np.float32), embedding_space=space)
+    return doc_id, chunk
+
+
+@pytest.mark.parametrize("rrf_k", [1, 10, 100])
+def test_zero_cosine_missing_answer_is_weak_regardless_of_rank(tmp_path, rrf_k):
+    conn = init_db(str(tmp_path / "weak.db"))
+    _insert_vector_doc(conn, "recipe.md", "pasta tomato", [1, 0])
+    searcher = Searcher(conn, rrf_k=rrf_k)
+    searcher.load()
+    results, meta = searcher.query_with_meta(
+        "orbital launch", top_k=1, query_embedding=np.array([0, 1], dtype=np.float32),
+    )
+    assert results
+    assert results[0]["cosine_similarity"] == pytest.approx(0)
+    assert results[0]["confidence"] == "low"
+    assert meta["weak_match"] is True
+    assert meta["confidence_calibrated"] is False
+
+
+def test_single_candidate_is_reranked(tmp_path):
+    conn = init_db(str(tmp_path / "singleton.db"))
+    _insert_vector_doc(conn, "answer.md", "matching query", [1, 0])
+    searcher = Searcher(conn, reranker_enabled=True)
+    searcher.load()
+    with patch("agents_rag.searcher._rerank_fn", return_value=np.array([0.002])) as rerank:
+        results, meta = searcher.query_with_meta(
+            "matching query", top_k=1, query_embedding=np.array([1, 0], dtype=np.float32),
+        )
+    rerank.assert_called_once()
+    assert results[0]["score"] == pytest.approx(0.002)
+    assert meta["score_kind"] == "rerank"
+    assert meta["weak_match"] is True
+
+
+def test_same_count_vector_replacement_rejects_stale_hnsw_cache(tmp_path):
+    conn = init_db(str(tmp_path / "index.db"))
+    first_id, first_chunk = _insert_vector_doc(conn, "a.md", "alpha", [1, 0])
+    second_id, second_chunk = _insert_vector_doc(conn, "b.md", "beta", [-1, 0])
+    searcher = Searcher(conn)
+    searcher.load()
+    stale_blob, stale_count = db.load_hnsw_cache(conn)
+    stale_fingerprint = searcher._index_fingerprint
+    old_generation = searcher.loaded_generation
+
+    upsert_chunks(conn, first_id, [first_chunk], np.array([[-1, 0]], dtype=np.float32))
+    upsert_chunks(conn, second_id, [second_chunk], np.array([[1, 0]], dtype=np.float32))
+    # Retain a realistic stale cache even if a writer invalidates it eagerly.
+    db.save_hnsw_cache(conn, stale_blob, stale_count, fingerprint=stale_fingerprint)
+    searcher.reload()
+
+    hits = searcher._vector_search("q", 1, None, query_vec=np.array([1, 0], dtype=np.float32))
+    assert searcher._metadata[hits[0][0]]["path"] == "b.md"
+    assert searcher._index_fingerprint != stale_fingerprint
+    assert searcher.loaded_generation == db.corpus_generation(conn)
+    assert searcher.loaded_generation > old_generation
+    assert db.load_hnsw_cache(conn, fingerprint=stale_fingerprint) is None
+
+
+@pytest.mark.parametrize("source", ["docs", "sessions"])
+def test_grouped_results_keep_exact_evidence_provenance_and_deprecation(tmp_path, source):
+    conn = init_db(str(tmp_path / "evidence.db"))
+    text_parts = ["EXACT evidence alpha", "EXACT evidence beta"]
+    doc_id = upsert_document(conn, source, "history.md", "History", "", "\n".join(text_parts),
+                             summary="A lossy overview", completeness="legacy_summary")
+    chunks = [{"text": text, "section_heading": f"Turn {i}", "tags": [],
+               "start_line": i + 1, "end_line": i + 1,
+               "session_summary": "A lossy overview"} for i, text in enumerate(text_parts)]
+    upsert_chunks(conn, doc_id, chunks, np.array([[1, 0], [1, 0]], dtype=np.float32))
+    db.save_deprecated(conn, "history.md", "superseded by verified evidence")
+    searcher = Searcher(conn)
+    searcher.load()
+    results, _ = searcher.query_with_meta(
+        "evidence", top_k=2, min_results=2, query_embedding=np.array([1, 0], dtype=np.float32),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result["deprecated"] is True
+    assert "superseded" in result["deprecation_notice"]
+    assert result["completeness"] == "legacy_summary"
+    assert result["trust"] == "untrusted_source"
+    assert {span["text"] for span in result["evidence_spans"]} == set(text_parts)
+    for span in result["evidence_spans"]:
+        stored = db.get_evidence(conn, span["evidence_id"])
+        assert stored["text"] == span["text"]
+        assert stored["revision_id"] == span["revision_id"]
+        assert span["text"] in result["evidence"]
+
+
+def test_unknown_and_mismatched_embedding_spaces_remain_lexical_only(tmp_path):
+    conn = init_db(str(tmp_path / "spaces.db"))
+    profile = {"model": "known-model", "revision": "v1"}
+    known = db.register_embedding_space(conn, profile, 2)
+    other = db.register_embedding_space(conn, {"model": "other-model"}, 2)
+    _insert_vector_doc(conn, "known.md", "dense matching text", [1, 0], space=known)
+    _insert_vector_doc(conn, "other.md", "incompatible text", [1, 0], space=other)
+    _insert_vector_doc(conn, "legacy.md", "legacyneedle exact source", [1, 0, 0])
+    _insert_vector_doc(conn, "noise1.md", "garden hedges", [0, 1], space=known)
+    _insert_vector_doc(conn, "noise2.md", "cooking pasta", [0, 1], space=known)
+    searcher = Searcher(conn, expected_embedding_profile=profile)
+    assert searcher.load()
+    assert searcher._hnsw is None
+    dense_hits = searcher._vector_search("q", 10, None, query_vec=np.array([1, 0], dtype=np.float32))
+    dense_paths = {searcher._metadata[i]["path"] for i, _ in dense_hits}
+    assert "known.md" in dense_paths
+    assert "legacy.md" not in dense_paths
+    assert "other.md" not in dense_paths
+    results, _ = searcher.query_with_meta(
+        "legacyneedle", top_k=5, min_results=5, query_embedding=np.array([1, 0], dtype=np.float32),
+    )
+    legacy = next(r for r in results if r["path"] == "legacy.md")
+    assert legacy["evidence"] == "legacyneedle exact source"
+    assert legacy["cosine_similarity"] is None
+    assert legacy["confidence"] == "low"
+
+
+@pytest.mark.parametrize("include_noise", [False, True])
+def test_all_unknown_profile_uses_lexical_search_without_embedding(tmp_path, include_noise):
+    conn = init_db(str(tmp_path / "lexical.db"))
+    docs = [("hit.md", "uniqueneedle evidence")]
+    if include_noise:
+        docs.extend([("a.md", "pasta cooking"), ("b.md", "garden hedges")])
+    for path, text in docs:
+        _insert_vector_doc(conn, path, text, [1, 0])
+    searcher = Searcher(conn, expected_embedding_profile={"model": "new"})
+    assert searcher.load()
+    with patch("agents_rag.searcher.embed_texts", side_effect=AssertionError("must remain lexical")):
+        results = searcher.query("uniqueneedle")
+    assert [r["path"] for r in results] == ["hit.md"]
+
+
+def test_reload_waits_for_query_to_finish_using_its_generation(tmp_path):
+    conn = init_db(str(tmp_path / "concurrent.db"))
+    doc_id, chunk = _insert_vector_doc(conn, "a.md", "old evidence", [1, 0])
+    searcher = Searcher(conn)
+    searcher.load()
+    old_generation = searcher.loaded_generation
+    query_entered = threading.Event()
+    query_release = threading.Event()
+    reload_entered = threading.Event()
+    original_vector_search = searcher._vector_search
+
+    def paused_search(*args, **kwargs):
+        query_entered.set()
+        assert query_release.wait(timeout=5)
+        return original_vector_search(*args, **kwargs)
+
+    def reload_index():
+        reload_entered.set()
+        return searcher.reload()
+
+    with patch.object(searcher, "_vector_search", side_effect=paused_search):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            query = pool.submit(searcher.query_with_meta, "evidence", query_embedding=np.array([1, 0]))
+            assert query_entered.wait(timeout=5)
+            upsert_chunks(conn, doc_id, [{**chunk, "text": "new evidence"}], np.array([[0, 1]], dtype=np.float32))
+            reload_future = pool.submit(reload_index)
+            assert reload_entered.wait(timeout=5)
+            try:
+                assert not reload_future.done()
+            finally:
+                query_release.set()
+            results, meta = query.result(timeout=5)
+            assert reload_future.result(timeout=5)
+    assert results[0]["evidence"] == "old evidence"
+    assert meta["generation"] == old_generation
+    assert searcher.loaded_generation > old_generation

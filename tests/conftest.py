@@ -11,6 +11,14 @@ import pytest
 from agents_rag.db import init_db
 
 
+@pytest.fixture(autouse=True)
+def offline_tokenizer_budget(monkeypatch):
+    """Unit tests stub the model boundary; tokenizer contract has dedicated stub-model tests."""
+    from agents_rag.chunker import _estimate_tokens
+    monkeypatch.setattr("agents_rag.indexer.embedding_token_budget", lambda: (_estimate_tokens,512))
+    monkeypatch.setattr("agents_rag.server.embedding_token_budget", lambda: (_estimate_tokens,512))
+
+
 @pytest.fixture
 def tmp_cache(tmp_path: Path) -> str:
     """Empty cache directory for index storage."""

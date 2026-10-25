@@ -36,8 +36,12 @@ def isolated_paths(tmp_path, monkeypatch):
 
 
 def test_find_free_port_returns_open_socket():
-    port = daemon.find_free_port(start=40000, scan=20)
-    assert 40000 <= port < 40020
+    # Ask the OS for an eligible port; fixed ranges can be reserved on Windows.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
+        candidate.bind(("127.0.0.1", 0))
+        available_port = candidate.getsockname()[1]
+    port = daemon.find_free_port(start=available_port, scan=1)
+    assert port == available_port
     # Sanity: the returned port must actually be free at call time.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", port))
@@ -60,8 +64,11 @@ def test_port_persistence_roundtrip(isolated_paths):
 
 def test_is_running_returns_false_when_no_daemon(isolated_paths):
     assert daemon.is_running() is False
-    daemon.write_port(1)  # unlikely to have anything on port 1
-    assert daemon.is_running() is False
+    # Reserve a port without listening, so no unrelated service can answer.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as inactive:
+        inactive.bind(("127.0.0.1", 0))
+        daemon.write_port(inactive.getsockname()[1])
+        assert daemon.is_running() is False
 
 
 def test_is_running_detects_open_socket(isolated_paths):

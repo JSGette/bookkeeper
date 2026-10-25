@@ -12,6 +12,9 @@ build/
 .cursor/
 uv.lock
 .vscode/
-docs/
-eval/
-scripts/
+.venv*/
+*.db
+*.db-wal
+*.db-shm
+*.staging
+*.migration.lock
